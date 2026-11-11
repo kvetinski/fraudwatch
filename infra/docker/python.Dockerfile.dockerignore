@@ -1,0 +1,27 @@
+# Prevent copying data, credentials, local MLflow state and test artifacts.
+.git
+.venv
+.venv/**
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.db
+*.sqlite*
+*.pkl
+*.parquet
+*.csv
+data
+artifacts
+mlruns
+mlartifacts
+.env
+.env.*
+*.zip
+*.log
+*.bak
+*.pre-*
+.pytest_cache
+.mypy_cache
+.ruff_cache
+node_modules

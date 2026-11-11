@@ -1,0 +1,108 @@
+groups:
+  - name: fraudwatch-operational
+    interval: 1m
+    rules:
+      - alert: FraudWatchScoringWorkerDown
+        expr: up{job="fraudwatch-scoring"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch scoring worker exporter is down"
+          description: "Prometheus cannot scrape the scoring worker for at least 2 minutes."
+
+      - alert: FraudWatchLabelWorkerDown
+        expr: up{job="fraudwatch-labels"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch label worker exporter is down"
+          description: "Prometheus cannot scrape the label worker for at least 2 minutes."
+
+      - alert: FraudWatchScoringKafkaLagHigh
+        expr: sum(fraudwatch_scoring_kafka_lag) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch scoring Kafka backlog exceeds 1000 messages"
+          description: "Total committed-offset backlog has exceeded 1000 messages for 5 minutes."
+
+      - alert: FraudWatchScoringStalled
+        expr: |
+          (sum(fraudwatch_scoring_kafka_lag) > 0)
+          and (sum(rate(fraudwatch_scoring_events_total[5m])) == 0)
+          and (min(up{job="fraudwatch-scoring"}) == 1)
+        for: 3m
+        labels:
+          severity: critical
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch scoring has stalled with a Kafka backlog"
+          description: "Worker is scrapeable, but has made no scoring progress with backlog for at least 3 minutes after a 5-minute observation window."
+
+      - alert: FraudWatchScoringCommitFailures
+        expr: sum(increase(fraudwatch_scoring_kafka_commits_total{result="failure"}[5m])) >= 1
+        for: 0m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch encountered a Kafka offset commit failure"
+          description: "At least one scoring offset-commit failure occurred in the last 5 minutes."
+
+      - alert: FraudWatchScoringProcessingErrors
+        expr: sum(increase(fraudwatch_scoring_errors_total[5m])) >= 1
+        for: 0m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch scoring worker reported an error"
+          description: "At least one scoring worker error occurred in the last 5 minutes."
+
+      - alert: FraudWatchLabelProcessingErrors
+        expr: sum(increase(fraudwatch_labels_errors_total[5m])) >= 1
+        for: 0m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch label worker reported an error"
+          description: "At least one label worker error occurred in the last 5 minutes."
+
+      - alert: FraudWatchPendingQuarantines
+        expr: fraudwatch_scoring_pending_quarantine > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch has unresolved quarantine records"
+          description: "At least one quarantine record has been pending for 10 minutes. Review with scripts/quarantine.py."
+
+      - alert: FraudWatchBlockedTerminals
+        expr: fraudwatch_scoring_blocked_terminals > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch terminal-order blocks need investigation"
+          description: "At least one terminal has remained blocked for 10 minutes; ignoring a quarantine record alone does not unblock it."
+
+      - alert: FraudWatchScoringLatencyHigh
+        expr: |
+          (histogram_quantile(0.95, sum by (le) (rate(fraudwatch_scoring_stage_seconds_bucket{stage="total"}[5m]))) > 0.020)
+          and (sum(increase(fraudwatch_scoring_stage_seconds_count{stage="total"}[5m])) > 100)
+        for: 5m
+        labels:
+          severity: warning
+          service: fraudwatch
+        annotations:
+          summary: "FraudWatch scoring p95 latency exceeds 20 milliseconds"
+          description: "Estimated p95 worker processing plus Kafka commit latency exceeded 20ms for 5 minutes with more than 100 samples in the 5-minute window."

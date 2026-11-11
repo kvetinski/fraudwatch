@@ -1,0 +1,196 @@
+rule_files:
+  - ../fraudwatch-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: Scoring worker down is critical after 2 minutes
+    interval: 1m
+    input_series:
+      - series: 'up{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
+        values: '0+0x15'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FraudWatchScoringWorkerDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: FraudWatchScoringWorkerDown
+        exp_alerts:
+          - exp_labels:
+              job: fraudwatch-scoring
+              instance: 127.0.0.1:9101
+              severity: critical
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch scoring worker exporter is down"
+              description: "Prometheus cannot scrape the scoring worker for at least 2 minutes."
+
+  - name: Labels worker down is warning
+    interval: 1m
+    input_series:
+      - series: 'up{job="fraudwatch-labels",instance="127.0.0.1:9102"}'
+        values: '0+0x15'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FraudWatchLabelWorkerDown
+        exp_alerts:
+          - exp_labels:
+              job: fraudwatch-labels
+              instance: 127.0.0.1:9102
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch label worker exporter is down"
+              description: "Prometheus cannot scrape the label worker for at least 2 minutes."
+
+  - name: Persistent high Kafka lag
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_scoring_kafka_lag{partition="0"}'
+        values: '1201+0x15'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: FraudWatchScoringKafkaLagHigh
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: FraudWatchScoringKafkaLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch scoring Kafka backlog exceeds 1000 messages"
+              description: "Total committed-offset backlog has exceeded 1000 messages for 5 minutes."
+
+  - name: Blocked terminals and pending quarantines are actionable
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_scoring_pending_quarantine{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
+        values: '2+0x20'
+      - series: 'fraudwatch_scoring_blocked_terminals{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: FraudWatchPendingQuarantines
+        exp_alerts:
+          - exp_labels:
+              job: fraudwatch-scoring
+              instance: 127.0.0.1:9101
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch has unresolved quarantine records"
+              description: "At least one quarantine record has been pending for 10 minutes. Review with scripts/quarantine.py."
+      - eval_time: 12m
+        alertname: FraudWatchBlockedTerminals
+        exp_alerts:
+          - exp_labels:
+              job: fraudwatch-scoring
+              instance: 127.0.0.1:9101
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch terminal-order blocks need investigation"
+              description: "At least one terminal has remained blocked for 10 minutes; ignoring a quarantine record alone does not unblock it."
+
+  - name: A healthy but stalled scoring consumer with backlog alerts
+    interval: 1m
+    input_series:
+      - series: 'up{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
+        values: '1+0x20'
+      - series: 'fraudwatch_scoring_kafka_lag{partition="0"}'
+        values: '10+0x20'
+      - series: 'fraudwatch_scoring_events_total{outcome="scored"}'
+        values: '100+0x20'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: FraudWatchScoringStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch scoring has stalled with a Kafka backlog"
+              description: "Worker is scrapeable, but has made no scoring progress with backlog for at least 3 minutes after a 5-minute observation window."
+
+  - name: An idle worker without a Kafka backlog is healthy
+    interval: 1m
+    input_series:
+      - series: 'up{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
+        values: '1+0x20'
+      - series: 'fraudwatch_scoring_kafka_lag{partition="0"}'
+        values: '0+0x20'
+      - series: 'fraudwatch_scoring_events_total{outcome="scored"}'
+        values: '100+0x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: FraudWatchScoringStalled
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: FraudWatchScoringKafkaLagHigh
+        exp_alerts: []
+
+  - name: Repeated scoring errors and Kafka commit failures
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_scoring_errors_total{category="process"}'
+        values: '0+1x15'
+      - series: 'fraudwatch_scoring_kafka_commits_total{result="failure"}'
+        values: '0+1x15'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: FraudWatchScoringProcessingErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch scoring worker reported an error"
+              description: "At least one scoring worker error occurred in the last 5 minutes."
+      - eval_time: 8m
+        alertname: FraudWatchScoringCommitFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch encountered a Kafka offset commit failure"
+              description: "At least one scoring offset-commit failure occurred in the last 5 minutes."
+
+  - name: Label processing errors
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_labels_errors_total{category="process"}'
+        values: '0+1x15'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: FraudWatchLabelProcessingErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch label worker reported an error"
+              description: "At least one label worker error occurred in the last 5 minutes."
+
+  - name: Sustained high p95 scoring latency
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="0.02"}'
+        values: '0+0x20'
+      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="0.05"}'
+        values: '0+50x20'
+      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="+Inf"}'
+        values: '0+50x20'
+      - series: 'fraudwatch_scoring_stage_seconds_count{stage="total"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: FraudWatchScoringLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: fraudwatch
+            exp_annotations:
+              summary: "FraudWatch scoring p95 latency exceeds 20 milliseconds"
+              description: "Estimated p95 worker processing plus Kafka commit latency exceeded 20ms for 5 minutes with more than 100 samples in the 5-minute window."

@@ -1,0 +1,36 @@
+# Local environments and secrets
+.venv/
+.env
+.env.*
+!.env.example
+
+# Python build and test output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+
+# Local datasets, model artifacts, and MLflow state
+data/
+artifacts/
+mlflow.db*
+mlruns/
+
+# Local logs and patch-era backups
+*.log
+*.bak
+*.pre-*
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*~

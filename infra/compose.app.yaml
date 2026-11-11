@@ -1,0 +1,96 @@
+# Local Linux deployment overlay. Applied on top of infra/compose.yaml.
+# Relative paths are resolved from infra/, i.e. the FIRST Compose file.
+# Prometheus/Grafana remain managed by infra/compose.observability.yaml,
+# using host networking to scrape loopback-only published worker metrics.
+services:
+  kafka:
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 45s
+
+  ingestion:
+    image: fraudwatch/ingestion:local
+    build:
+      context: ../services/ingestion
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
+      KAFKA_BROKERS: kafka:19092
+      FRAUDWATCH_HTTP_ADDR: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  scoring:
+    image: fraudwatch/python-workers:local
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+    command: ["python", "services/scoring/worker.py"]
+    environment:
+      DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
+      KAFKA_BROKERS: kafka:19092
+      FRAUDWATCH_METRICS_BIND: 0.0.0.0
+      FRAUDWATCH_SCORING_METRICS_PORT: "9101"
+      FRAUDWATCH_MODEL_DIR: /models/candidate
+    volumes:
+      - type: bind
+        source: ../artifacts/candidate-model
+        target: /models/candidate
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:9101:9101"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9101/metrics', timeout=2).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 45s
+    restart: unless-stopped
+
+  labels:
+    image: fraudwatch/python-workers:local
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+    command: ["python", "services/scoring/label_worker.py"]
+    environment:
+      DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
+      KAFKA_BROKERS: kafka:19092
+      FRAUDWATCH_METRICS_BIND: 0.0.0.0
+      FRAUDWATCH_LABEL_METRICS_PORT: "9102"
+    ports:
+      - "127.0.0.1:9102:9102"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9102/metrics', timeout=2).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    restart: unless-stopped

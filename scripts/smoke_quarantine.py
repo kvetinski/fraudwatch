@@ -22,6 +22,7 @@ def main():
         b"{invalid-json",
         json.dumps({
             "transaction_id": transaction_id,
+            "customer_id": f"customer-{run_id}",
             "terminal_id": key,
             "amount": 0.0,
             "occurred_at": "2018-04-01T00:00:00Z",

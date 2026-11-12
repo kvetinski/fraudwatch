@@ -89,6 +89,35 @@ def test_tombstone_is_quarantined(monkeypatch):
     assert consumer.commits == 1
 
 
+def test_mismatched_transaction_key_is_quarantined(monkeypatch):
+    payload = json.dumps({
+        "transaction_id": "key-mismatch",
+        "customer_id": "customer-1",
+        "terminal_id": "expected-terminal",
+        "amount": 1.0,
+        "occurred_at": "2018-04-01T00:00:00Z",
+    }).encode()
+    stored = []
+    monkeypatch.setattr(
+        worker,
+        "store_quarantined",
+        lambda conn, **kwargs: stored.append(kwargs) or True,
+    )
+    consumer = FakeConsumer()
+
+    result = worker.process_and_commit(
+        None,
+        None,
+        consumer,
+        FakeMessage(payload, key=b"wrong-terminal"),
+    )
+
+    assert result[0:2] == (False, True)
+    assert isinstance(stored[0]["error"], InvalidTransaction)
+    assert "Kafka key" in str(stored[0]["error"])
+    assert consumer.commits == 1
+
+
 @pytest.mark.parametrize("failure", [
     RuntimeError("database unavailable"),
     ValueError("out-of-order terminal transaction"),

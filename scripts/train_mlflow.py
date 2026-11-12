@@ -19,6 +19,10 @@ from fraudwatch_ml.features import (
     TERMINAL_WINDOWS_DAYS,
     build_features,
 )
+from fraudwatch_ml.model_serialization import (
+    APPROVED_SKOPS_TRUSTED_TYPES,
+    SKLEARN_SERIALIZATION_FORMAT,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,10 +166,8 @@ def main():
             name="fraud_classifier",
             signature=signature,
             input_example=example,
-            serialization_format="skops",
-            skops_trusted_types=[
-                "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor",
-            ],
+            serialization_format=SKLEARN_SERIALIZATION_FORMAT,
+            skops_trusted_types=list(APPROVED_SKOPS_TRUSTED_TYPES),
         )
 
 

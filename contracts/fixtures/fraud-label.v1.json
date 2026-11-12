@@ -1,0 +1,67 @@
+{
+  "contract": "fraud-label.v1",
+  "cases": [
+    {
+      "name": "valid_nonfraud_utc",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":0,\"observed_at\":\"2018-04-08T00:00:00Z\"}",
+      "valid": true,
+      "normalized_observed_at": "2018-04-08T00:00:00Z"
+    },
+    {
+      "name": "valid_fraud_offset",
+      "payload": "{\"transaction_id\":\"tx-2\",\"fraud_label\":1,\"observed_at\":\"2018-04-08T03:00:00.500+03:00\"}",
+      "valid": true,
+      "normalized_observed_at": "2018-04-08T00:00:00.5Z"
+    },
+    {
+      "name": "missing_transaction_id",
+      "payload": "{\"fraud_label\":1,\"observed_at\":\"2018-04-08T00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "whitespace_transaction_id",
+      "payload": "{\"transaction_id\":\" \",\"fraud_label\":1,\"observed_at\":\"2018-04-08T00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "null_label",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":null,\"observed_at\":\"2018-04-08T00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "boolean_label",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":true,\"observed_at\":\"2018-04-08T00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "label_out_of_range",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":2,\"observed_at\":\"2018-04-08T00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "timestamp_without_timezone",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":1,\"observed_at\":\"2018-04-08T00:00:00\"}",
+      "valid": false
+    },
+    {
+      "name": "timestamp_with_space_separator",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":1,\"observed_at\":\"2018-04-08 00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "invalid_calendar_date",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":1,\"observed_at\":\"2018-02-30T00:00:00Z\"}",
+      "valid": false
+    },
+    {
+      "name": "unknown_field",
+      "payload": "{\"transaction_id\":\"tx-1\",\"fraud_label\":1,\"observed_at\":\"2018-04-08T00:00:00Z\",\"unexpected\":true}",
+      "valid": false
+    },
+    {
+      "name": "malformed_json",
+      "payload": "{broken-json",
+      "valid": false
+    }
+  ]
+}

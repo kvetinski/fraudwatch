@@ -1,21 +1,20 @@
 
-import json
 from datetime import datetime, timedelta, timezone
 
+from fraudwatch_ml.contracts import (
+    LABEL_FIELDS,
+    decode_event_object,
+    require_rfc3339,
+)
 from fraudwatch_ml.features import LABEL_DELAY_DAYS
 
 
 def parse_label(payload: bytes) -> tuple[str, int, datetime]:
-    data = json.loads(payload)
-
-    required = {
-        "transaction_id",
-        "fraud_label",
-        "observed_at",
-    }
-
-    if not isinstance(data, dict) or set(data) != required:
-        raise ValueError("Invalid fraud-label event schema")
+    data = decode_event_object(
+        payload,
+        expected_fields=LABEL_FIELDS,
+        event_name="fraud-label",
+    )
 
     transaction_id = data["transaction_id"]
     label = data["fraud_label"]
@@ -27,15 +26,11 @@ def parse_label(payload: bytes) -> tuple[str, int, datetime]:
     if type(label) is not int or label not in (0, 1):
         raise ValueError("Fraud label must be 0 or 1")
 
-    if not isinstance(timestamp, str):
-        raise ValueError("Invalid observation timestamp")
+    require_rfc3339(timestamp, field_name="observed_at")
 
     observed_at = datetime.fromisoformat(
         timestamp.replace("Z", "+00:00")
     )
-
-    if observed_at.tzinfo is None:
-        raise ValueError("Observation timestamp must include timezone")
 
     return (
         transaction_id,

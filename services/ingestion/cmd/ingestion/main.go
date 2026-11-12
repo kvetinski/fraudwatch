@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -22,9 +23,18 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-const topic = "transactions.v1"
+const (
+	topic         = "transactions.v1"
+	maxEventBytes = 64 << 10
+)
 
 var ErrConflict = errors.New("transaction ID already has a different payload")
+
+var strictRFC3339 = regexp.MustCompile(
+	`^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T` +
+		`([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]` +
+		`(\.[0-9]{1,9})?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$`,
+)
 
 type Transaction struct {
 	TransactionID string  `json:"transaction_id"`
@@ -32,6 +42,14 @@ type Transaction struct {
 	TerminalID    string  `json:"terminal_id"`
 	Amount        float64 `json:"amount"`
 	OccurredAt    string  `json:"occurred_at"`
+}
+
+type transactionEnvelope struct {
+	TransactionID string   `json:"transaction_id"`
+	CustomerID    string   `json:"customer_id"`
+	TerminalID    string   `json:"terminal_id"`
+	Amount        *float64 `json:"amount"`
+	OccurredAt    string   `json:"occurred_at"`
 }
 
 type Server struct {
@@ -50,6 +68,9 @@ func validate(tx *Transaction) error {
 		return errors.New("amount must be finite and non-negative")
 	}
 
+	if !strictRFC3339.MatchString(tx.OccurredAt) {
+		return errors.New("occurred_at must use strict RFC3339")
+	}
 	t, err := time.Parse(time.RFC3339Nano, tx.OccurredAt)
 	if err != nil {
 		return errors.New("occurred_at must be RFC3339")
@@ -57,6 +78,41 @@ func validate(tx *Transaction) error {
 
 	tx.OccurredAt = t.UTC().Format(time.RFC3339Nano)
 	return nil
+}
+
+func decodeTransaction(body io.Reader) (Transaction, error) {
+	var envelope transactionEnvelope
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&envelope); err != nil {
+		return Transaction{}, errors.New("invalid transaction JSON")
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return Transaction{}, errors.New("unexpected trailing JSON")
+	}
+
+	if envelope.Amount == nil {
+		return Transaction{}, errors.New("amount is required and must not be null")
+	}
+
+	event := Transaction{
+		TransactionID: envelope.TransactionID,
+		CustomerID:    envelope.CustomerID,
+		TerminalID:    envelope.TerminalID,
+		Amount:        *envelope.Amount,
+		OccurredAt:    envelope.OccurredAt,
+	}
+	if err := validate(&event); err != nil {
+		return Transaction{}, err
+	}
+	return event, nil
+}
+
+func transactionKafkaKey(event Transaction) string {
+	return event.TerminalID
 }
 
 // acceptTransaction returns duplicate=true for an identical replay.
@@ -113,7 +169,7 @@ func acceptTransaction(
 		INSERT INTO outbox_events
 		    (transaction_id, topic, kafka_key, payload)
 		VALUES ($1, $2, $3, $4)
-	`, event.TransactionID, topic, event.TerminalID, payload)
+	`, event.TransactionID, topic, transactionKafkaKey(event), payload)
 	if err != nil {
 		return false, err
 	}
@@ -123,25 +179,11 @@ func acceptTransaction(
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, maxEventBytes)
 	defer r.Body.Close()
 
-	var event Transaction
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&event); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		http.Error(w, "unexpected trailing JSON", http.StatusBadRequest)
-		return
-	}
-
-	if err := validate(&event); err != nil {
+	event, err := decodeTransaction(r.Body)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

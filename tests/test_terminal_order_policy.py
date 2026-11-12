@@ -28,6 +28,7 @@ class Message:
         self._offset = offset
         self._payload = json.dumps({
             "transaction_id": transaction_id,
+            "customer_id": f"customer-{transaction_id}",
             "terminal_id": terminal_id,
             "amount": 37.5,
             "occurred_at": at,

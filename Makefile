@@ -4,7 +4,16 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
+# Each target intentionally uses only part of the shared Compose project. Keep
+# Compose from misclassifying services started by another overlay as orphans.
+export COMPOSE_IGNORE_ORPHANS := true
+
 COMPOSE := docker compose -f infra/compose.yaml
+# Use every overlay for project-wide lifecycle operations. This prevents a
+# service from being left running merely because it belongs to another overlay.
+STACK_COMPOSE := docker compose -f infra/compose.yaml \
+	-f infra/compose.app.yaml \
+	-f infra/compose.observability.yaml
 PYTHON3 ?= /usr/bin/python3
 PY := .venv/bin/python
 MLFLOW := .venv/bin/mlflow
@@ -12,10 +21,10 @@ GO_DIR := services/ingestion
 TEST_DATABASE_URL ?= postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch_test?sslmode=disable
 DATA_REPO := https://github.com/Fraud-Detection-Handbook/simulated-data-raw.git
 
-.PHONY: help check venv install data kafka-permissions up down status \
+.PHONY: help check venv install data kafka-permissions up down stop-all down-all status \
         wait-db init-test-db migrate wait-kafka topics go-deps \
         model-bootstrap train mlflow-ui smoke run-api run-scoring run-labels \
-        test test-python test-go setup
+        test test-python test-go setup clean clean-all
 
 help: ## Show available commands
 	@awk 'BEGIN {FS=":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -49,11 +58,56 @@ kafka-permissions: ## Ensure Kafka named volume is writable by UID 1000
 up: kafka-permissions ## Start local Kafka and PostgreSQL (preserve volumes)
 	@$(COMPOSE) up -d kafka postgres
 
-down: ## Stop containers (preserve all volumes and MLflow artifacts)
+down: ## Remove Kafka/PostgreSQL containers (preserve named volumes)
 	@$(COMPOSE) down
+
+stop-all: ## Stop all Compose services (preserve containers and data)
+	@$(STACK_COMPOSE) stop
+
+down-all: ## Remove all project containers/network (preserve volumes and files)
+	@$(STACK_COMPOSE) down --remove-orphans
 
 status: ## Display local infrastructure state
 	@$(COMPOSE) ps -a
+
+clean: ## Remove generated caches and build/test output (preserve local runtime data)
+	@rm -rf -- \
+		"$(CURDIR)/.pytest_cache" \
+		"$(CURDIR)/.mypy_cache" \
+		"$(CURDIR)/.ruff_cache" \
+		"$(CURDIR)/htmlcov" \
+		"$(CURDIR)/build" \
+		"$(CURDIR)/dist" \
+		"$(CURDIR)/fraudwatch_ml.egg-info"
+	@find "$(CURDIR)" -maxdepth 1 -type f \
+		\( -name '.coverage' -o -name '.coverage.*' -o -name 'coverage.xml' \) -delete
+	@for path in fraudwatch_ml scripts services tests; do \
+		if [ -d "$(CURDIR)/$$path" ]; then \
+			find "$(CURDIR)/$$path" -type f \
+				\( -name '*.pyc' -o -name '*.pyo' \) -delete; \
+			find "$(CURDIR)/$$path" -depth -type d -name __pycache__ \
+				-exec rm -rf -- {} +; \
+		fi; \
+	done
+	@echo 'Generated caches and build/test output removed.'
+
+clean-all: ## DESTRUCTIVE: stop stack and delete all local state (CONFIRM=clean-all)
+	@test "$(CONFIRM)" = 'clean-all' || { \
+		echo 'Refusing full reset without CONFIRM=clean-all.' >&2; \
+		echo 'This deletes Compose volumes, local data/models, MLflow state, .venv, and project images.' >&2; \
+		exit 2; \
+	}
+	@echo 'Stopping the complete Compose stack and deleting its named volumes...'
+	@$(STACK_COMPOSE) down --volumes --remove-orphans
+	@$(MAKE) --no-print-directory clean
+	@rm -rf -- \
+		"$(CURDIR)/.venv" \
+		"$(CURDIR)/artifacts" \
+		"$(CURDIR)/data" \
+		"$(CURDIR)/mlruns"
+	@find "$(CURDIR)" -maxdepth 1 -type f -name 'mlflow.db*' -delete
+	-@docker image rm fraudwatch/ingestion:local fraudwatch/python-workers:local >/dev/null 2>&1
+	@echo 'Full local reset complete. Source files, Git metadata, .env files, and review/ were preserved.'
 
 wait-db: up ## Wait for PostgreSQL to accept connections
 	@for i in $$(seq 1 60); do \
@@ -89,10 +143,16 @@ wait-kafka: up ## Wait for Kafka to respond to a metadata request
 
 topics: wait-kafka ## Ensure both versioned Kafka topics exist
 	@for topic in transactions.v1 fraud-labels.v1; do \
-		$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+		if $(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-topics.sh \
 			--bootstrap-server localhost:19092 \
-			--create --if-not-exists --topic "$$topic" \
-			--partitions 3 --replication-factor 1; \
+			--describe --topic "$$topic" >/dev/null 2>&1; then \
+			echo "Kafka topic: $$topic (exists)"; \
+		else \
+			$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+				--bootstrap-server localhost:19092 \
+				--create --topic "$$topic" \
+				--partitions 3 --replication-factor 1; \
+		fi; \
 	done
 
 go-deps: ## Download Go ingestion-service dependencies

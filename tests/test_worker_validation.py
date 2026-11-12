@@ -11,6 +11,7 @@ from services.scoring.worker import parse_transaction
 def test_valid_amounts(amount):
     payload = json.dumps({
         "transaction_id": "test-amount",
+        "customer_id": "customer-1",
         "terminal_id": "123",
         "amount": amount,
         "occurred_at": "2018-04-01T00:00:00Z",
@@ -27,6 +28,7 @@ def test_valid_amounts(amount):
 def test_invalid_amounts(amount):
     payload = json.dumps({
         "transaction_id": "test-amount",
+        "customer_id": "customer-1",
         "terminal_id": "123",
         "amount": amount,
         "occurred_at": "2018-04-01T00:00:00Z",

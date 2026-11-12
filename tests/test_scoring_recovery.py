@@ -22,8 +22,9 @@ class FixedModel:
 
 
 class FakeMessage:
-    def __init__(self, payload):
+    def __init__(self, payload, key):
         self._payload = payload
+        self._key = key
 
     def topic(self):
         return "transactions.v1"
@@ -35,7 +36,7 @@ class FakeMessage:
         return 123456789
 
     def key(self):
-        return b"recovery-test"
+        return self._key
 
     def value(self):
         return self._payload
@@ -80,12 +81,13 @@ def test_scoring_recovers_after_db_commit_but_failed_kafka_ack():
     payload = json.dumps(
         {
             "transaction_id": transaction_id,
+            "customer_id": f"recovery-customer-{uuid.uuid4().hex}",
             "terminal_id": terminal_id,
             "occurred_at": "2018-04-01T00:00:00Z",
             "amount": 0.0,
         }
     ).encode("utf-8")
-    msg = FakeMessage(payload)
+    msg = FakeMessage(payload, terminal_id.encode())
     scorer = LoadedScorer(
         model=FixedModel(),
         model_reference="models:/fraudwatch-hgb/recovery-test",

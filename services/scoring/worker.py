@@ -27,6 +27,12 @@ from mlflow.tracking import MlflowClient
 from psycopg.types.json import Jsonb
 
 from fraudwatch_ml.features import FEATURE_NAMES, LABEL_DELAY_DAYS
+from fraudwatch_ml.contracts import (
+    TRANSACTION_FIELDS,
+    EventContractError,
+    decode_event_object,
+    require_rfc3339,
+)
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 from fraudwatch_ml.profiling import EventTimings, RollingProfiler
 from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
@@ -108,20 +114,24 @@ def parse_transaction(payload: bytes) -> tuple[Transaction, pd.Timestamp]:
     Do not turn database/model errors or timestamp ordering violations into it.
     """
     try:
-        data = json.loads(payload)
-    except (ValueError, UnicodeError, TypeError) as exc:
-        raise InvalidTransaction("Invalid transaction JSON") from exc
-
-    if not isinstance(data, dict):
-        raise InvalidTransaction("Transaction payload must be a JSON object")
+        data = decode_event_object(
+            payload,
+            expected_fields=TRANSACTION_FIELDS,
+            event_name="transaction",
+        )
+    except EventContractError as exc:
+        raise InvalidTransaction(str(exc)) from exc
 
     transaction_id = data.get("transaction_id")
+    customer_id = data.get("customer_id")
     terminal_id = data.get("terminal_id")
     amount = data.get("amount")
     timestamp = data.get("occurred_at")
 
     if not isinstance(transaction_id, str) or not transaction_id.strip():
         raise InvalidTransaction("Invalid transaction_id")
+    if not isinstance(customer_id, str) or not customer_id.strip():
+        raise InvalidTransaction("Invalid customer_id")
     if not isinstance(terminal_id, str) or not terminal_id.strip():
         raise InvalidTransaction("Invalid terminal_id")
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
@@ -132,19 +142,11 @@ def parse_transaction(payload: bytes) -> tuple[Transaction, pd.Timestamp]:
         raise InvalidTransaction("Amount outside supported range") from exc
     if not finite or amount < 0:
         raise InvalidTransaction("Amount must be non-negative and finite")
-    if not isinstance(timestamp, str):
-        raise InvalidTransaction("Invalid occurred_at")
-
     try:
+        require_rfc3339(timestamp, field_name="occurred_at")
         occurred_at = pd.Timestamp(timestamp)
-        if pd.isna(occurred_at) or occurred_at.tzinfo is None:
-            raise InvalidTransaction(
-                "occurred_at must be a timezone-aware timestamp"
-            )
         occurred_at = occurred_at.tz_convert("UTC")
-    except InvalidTransaction:
-        raise
-    except (ValueError, TypeError, OverflowError) as exc:
+    except (EventContractError, ValueError, TypeError, OverflowError) as exc:
         raise InvalidTransaction("Invalid occurred_at timestamp") from exc
 
     event = Transaction(
@@ -154,6 +156,16 @@ def parse_transaction(payload: bytes) -> tuple[Transaction, pd.Timestamp]:
         amount=float(amount),
     )
     return event, occurred_at
+
+
+def validate_transaction_key(
+    event: Transaction,
+    kafka_key: bytes | None,
+) -> None:
+    """Require the transaction stream key declared by the v1 contract."""
+    expected = event.terminal_id.encode("utf-8")
+    if kafka_key != expected:
+        raise InvalidTransaction("Kafka key must equal terminal_id")
 
 
 class MeasuredHistory:
@@ -195,6 +207,7 @@ def process_event(
 
     t0 = perf_counter_ns()
     event, occurred_at = parse_transaction(payload)
+    validate_transaction_key(event, kafka_key)
     payload_hash = hashlib.sha256(payload).digest()
     timings.add("parse", perf_counter_ns() - t0)
 

@@ -1,0 +1,141 @@
+{
+  "contract": "transaction.v1",
+  "cases": [
+    {
+      "name": "valid_zero_amount_utc",
+      "payload": "{\"transaction_id\":\"tx-zero\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":0,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": true,
+      "valid_stream": true,
+      "normalized_occurred_at": "2018-04-01T00:00:00Z"
+    },
+    {
+      "name": "valid_fractional_offset",
+      "payload": "{\"transaction_id\":\"tx-offset\",\"customer_id\":\"customer-2\",\"terminal_id\":\"terminal-2\",\"amount\":19.95,\"occurred_at\":\"2018-04-01T03:00:00.250+03:00\"}",
+      "kafka_key": "terminal-2",
+      "valid_payload": true,
+      "valid_stream": true,
+      "normalized_occurred_at": "2018-04-01T00:00:00.25Z"
+    },
+    {
+      "name": "kafka_key_mismatch",
+      "payload": "{\"transaction_id\":\"tx-key\",\"customer_id\":\"customer-3\",\"terminal_id\":\"terminal-3\",\"amount\":5,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "another-terminal",
+      "valid_payload": true,
+      "valid_stream": false,
+      "normalized_occurred_at": "2018-04-01T00:00:00Z"
+    },
+    {
+      "name": "missing_transaction_id",
+      "payload": "{\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "missing_customer_id",
+      "payload": "{\"transaction_id\":\"tx-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "missing_terminal_id",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "missing_amount",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "null_amount",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":null,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "boolean_amount",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":true,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "negative_amount",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":-0.01,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "nonfinite_amount",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":NaN,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "whitespace_transaction_id",
+      "payload": "{\"transaction_id\":\"  \",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "whitespace_customer_id",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"\\t\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "whitespace_terminal_id",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"\\n\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "timestamp_without_timezone",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "timestamp_with_space_separator",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01 00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "invalid_calendar_date",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-02-30T00:00:00Z\"}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "unknown_field",
+      "payload": "{\"transaction_id\":\"tx-1\",\"customer_id\":\"customer-1\",\"terminal_id\":\"terminal-1\",\"amount\":1,\"occurred_at\":\"2018-04-01T00:00:00Z\",\"unexpected\":true}",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    },
+    {
+      "name": "malformed_json",
+      "payload": "{broken-json",
+      "kafka_key": "terminal-1",
+      "valid_payload": false,
+      "valid_stream": false
+    }
+  ]
+}

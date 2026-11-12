@@ -71,6 +71,20 @@ The main processing path is:
 - Metrics are operational signals, not an audit log. PostgreSQL remains the
   source of truth.
 
+## Event contracts
+
+The versioned JSON Schemas in [`contracts/`](contracts/README.md) define the
+authoritative transaction and delayed-label envelopes. A shared fixture corpus
+is executed by both Go and Python tests to prevent ingress and stream validation
+from drifting independently.
+
+Transactions contain exactly `transaction_id`, `customer_id`, `terminal_id`,
+`amount`, and `occurred_at`. Events reject unknown fields, missing or null
+amounts, booleans, negative or nonfinite values, whitespace-only IDs, loose or
+timezone-free timestamps, payloads over 64 KiB, and Kafka keys different from
+`terminal_id`. Zero remains a valid amount, and accepted timestamps normalize
+to UTC.
+
 ## Prerequisites
 
 - Linux (the current monitoring overlay uses Docker host networking)
@@ -116,15 +130,42 @@ Useful endpoints:
 | Prometheus | `http://127.0.0.1:9090` |
 | Grafana | `http://127.0.0.1:3000` |
 
-Run `make help` to see all supported commands. `make down` stops Kafka and
-PostgreSQL without deleting their named volumes.
+Run `make help` to see all supported commands. `make down` removes only the
+Kafka and PostgreSQL containers without deleting their named volumes.
+
+## Stopping and cleaning the local environment
+
+The cleanup targets are deliberately layered so routine cleanup does not erase
+datasets, models, or database state:
+
+```bash
+make stop-all   # stop every Compose service; keep containers and data
+make down-all   # remove every project container/network; keep volumes and files
+make clean      # remove Python caches plus build/test output
+```
+
+Processes started in a foreground terminal (`make run-api`, `make run-scoring`,
+`make run-labels`, and `make mlflow-ui`) are not managed by Compose. Stop those
+with Ctrl+C in their terminal.
+
+A full reset requires an explicit confirmation:
+
+```bash
+make clean-all CONFIRM=clean-all
+```
+
+This stops and removes the complete Compose stack, deletes its named volumes,
+and removes `.venv`, the downloaded dataset, exported models, MLflow state,
+caches, and FraudWatch-built container images. It intentionally preserves
+source files, Git metadata, `.env` files, and the private ignored `review/`
+directory. Re-run `make setup` afterward.
 
 ## Ingestion API
 
 Submit a transaction with all five required fields:
 
 ```bash
-curl --fail-with-body \
+curl --include \
   -H 'Content-Type: application/json' \
   -d '{
     "transaction_id": "demo-0001",
@@ -309,6 +350,7 @@ Database-dependent cases are skipped when `TEST_DATABASE_URL` is not set.
 
 ```text
 fraudwatch_ml/                  shared feature, scoring, label, and reliability code
+contracts/                      versioned JSON Schemas and shared contract fixtures
 services/ingestion/             Go API and transactional outbox publisher
 services/scoring/               Python scoring and delayed-label consumers
 infra/compose.yaml              Kafka and PostgreSQL
@@ -329,8 +371,6 @@ The baseline is intentionally explicit about its remaining gaps:
 
 - The quarantine CLI and lifecycle smoke script still default to the obsolete
   `/transactions` route. Pass `/v1/transactions` explicitly as shown above.
-- Go ingress and Python stream validation are not yet defined by one shared
-  contract, so their treatment of fields and malformed payloads can drift.
 - A poison label record currently terminates the label worker; it has no durable
   label dead-letter path yet.
 - Terminal-order recovery, historical reconciliation, and audited unblock are

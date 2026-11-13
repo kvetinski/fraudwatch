@@ -18,9 +18,13 @@ from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
 class OutOfOrderTransaction(InvalidTransaction):
     """An older event arrived after a newer terminal event was already scored."""
 
+    default_reason_code = "transaction.out_of_order"
+
 
 class TerminalBlocked(InvalidTransaction):
     """An event belongs to a terminal with unresolved history ordering."""
+
+    default_reason_code = "transaction.terminal_blocked"
 
 
 @dataclass(frozen=True)
@@ -63,7 +67,7 @@ def block_for_late_event(
     )
     row = conn.execute(
         """
-        SELECT id FROM scoring_quarantine
+        SELECT id FROM event_quarantine
         WHERE source_topic = %s
           AND source_partition = %s
           AND source_offset = %s

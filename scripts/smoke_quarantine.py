@@ -1,7 +1,7 @@
 """Send one malformed and one valid event keyed to the same Kafka partition.
 
 Run with the scoring worker running. This script publishes only; it does not
-wait for the database, so inspect scoring_quarantine and fraud_decisions.
+wait for the database, so inspect event_quarantine and fraud_decisions.
 """
 
 import json

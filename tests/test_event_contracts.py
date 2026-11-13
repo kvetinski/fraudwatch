@@ -10,7 +10,7 @@ import pytest
 
 from fraudwatch_ml.contracts import MAX_EVENT_BYTES
 from fraudwatch_ml.labels import parse_label
-from fraudwatch_ml.quarantine import InvalidTransaction
+from fraudwatch_ml.quarantine import InvalidLabel, InvalidTransaction
 from services.scoring.worker import (
     parse_transaction,
     validate_transaction_key,
@@ -63,7 +63,7 @@ def test_label_contract_fixtures(case):
     payload = case["payload"].encode("utf-8")
 
     if not case["valid"]:
-        with pytest.raises(ValueError):
+        with pytest.raises(InvalidLabel):
             parse_label(payload)
         return
 

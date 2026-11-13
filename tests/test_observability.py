@@ -42,10 +42,15 @@ def test_label_metrics_only_acknowledged_events():
     metrics = LabelMetrics(registry=registry)
     metrics.observe_result(inserted=True, db_seconds=0.001, commit_seconds=0.0002)
     metrics.observe_result(inserted=False, db_seconds=0.001, commit_seconds=0.0002)
+    metrics.observe_result(
+        inserted=False, quarantined=True,
+        db_seconds=0.001, commit_seconds=0.0002,
+    )
     data = generate_latest(registry).decode()
     assert 'fraudwatch_labels_events_total{outcome="inserted"} 1.0' in data
     assert 'fraudwatch_labels_events_total{outcome="duplicate"} 1.0' in data
-    assert 'fraudwatch_labels_stage_seconds_count{stage="total"} 2.0' in data
+    assert 'fraudwatch_labels_events_total{outcome="quarantined"} 1.0' in data
+    assert 'fraudwatch_labels_stage_seconds_count{stage="total"} 3.0' in data
 
 
 def test_snapshot_lag_uses_committed_offset_not_fetched_position():

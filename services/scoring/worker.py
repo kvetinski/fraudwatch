@@ -120,7 +120,9 @@ def parse_transaction(payload: bytes) -> tuple[Transaction, pd.Timestamp]:
             event_name="transaction",
         )
     except EventContractError as exc:
-        raise InvalidTransaction(str(exc)) from exc
+        raise InvalidTransaction(
+            str(exc), reason_code="transaction.contract_violation"
+        ) from exc
 
     transaction_id = data.get("transaction_id")
     customer_id = data.get("customer_id")
@@ -129,25 +131,45 @@ def parse_transaction(payload: bytes) -> tuple[Transaction, pd.Timestamp]:
     timestamp = data.get("occurred_at")
 
     if not isinstance(transaction_id, str) or not transaction_id.strip():
-        raise InvalidTransaction("Invalid transaction_id")
+        raise InvalidTransaction(
+            "Invalid transaction_id",
+            reason_code="transaction.invalid_transaction_id",
+        )
     if not isinstance(customer_id, str) or not customer_id.strip():
-        raise InvalidTransaction("Invalid customer_id")
+        raise InvalidTransaction(
+            "Invalid customer_id",
+            reason_code="transaction.invalid_customer_id",
+        )
     if not isinstance(terminal_id, str) or not terminal_id.strip():
-        raise InvalidTransaction("Invalid terminal_id")
+        raise InvalidTransaction(
+            "Invalid terminal_id",
+            reason_code="transaction.invalid_terminal_id",
+        )
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-        raise InvalidTransaction("Invalid amount")
+        raise InvalidTransaction(
+            "Invalid amount", reason_code="transaction.invalid_amount"
+        )
     try:
         finite = math.isfinite(amount)
     except (OverflowError, ValueError, TypeError) as exc:
-        raise InvalidTransaction("Amount outside supported range") from exc
+        raise InvalidTransaction(
+            "Amount outside supported range",
+            reason_code="transaction.invalid_amount",
+        ) from exc
     if not finite or amount < 0:
-        raise InvalidTransaction("Amount must be non-negative and finite")
+        raise InvalidTransaction(
+            "Amount must be non-negative and finite",
+            reason_code="transaction.invalid_amount",
+        )
     try:
         require_rfc3339(timestamp, field_name="occurred_at")
         occurred_at = pd.Timestamp(timestamp)
         occurred_at = occurred_at.tz_convert("UTC")
     except (EventContractError, ValueError, TypeError, OverflowError) as exc:
-        raise InvalidTransaction("Invalid occurred_at timestamp") from exc
+        raise InvalidTransaction(
+            "Invalid occurred_at timestamp",
+            reason_code="transaction.invalid_timestamp",
+        ) from exc
 
     event = Transaction(
         transaction_id=transaction_id,
@@ -165,7 +187,10 @@ def validate_transaction_key(
     """Require the transaction stream key declared by the v1 contract."""
     expected = event.terminal_id.encode("utf-8")
     if kafka_key != expected:
-        raise InvalidTransaction("Kafka key must equal terminal_id")
+        raise InvalidTransaction(
+            "Kafka key must equal terminal_id",
+            reason_code="transaction.kafka_key_mismatch",
+        )
 
 
 class MeasuredHistory:
@@ -229,7 +254,10 @@ def process_event(
 
         if existing is not None:
             if bytes(existing[0]) != payload_hash:
-                raise InvalidTransaction(f"Conflicting payload for {event.transaction_id}")
+                raise InvalidTransaction(
+                    f"Conflicting payload for {event.transaction_id}",
+                    reason_code="transaction.conflict",
+                )
             return False
 
         # Duplicate decisions are checked before the block so an earlier
@@ -354,7 +382,10 @@ def process_and_commit(conn, scorer, consumer, msg, timings=None, metrics=None):
     try:
         payload = msg.value()
         if payload is None:
-            raise InvalidTransaction("Kafka tombstone is not a transaction")
+            raise InvalidTransaction(
+                "Kafka tombstone is not a transaction",
+                reason_code="transaction.tombstone",
+            )
         outcome = process_event(
             conn, scorer, payload, msg.partition(), msg.offset(),
             timings=timings, source_topic=msg.topic(), kafka_key=msg.key(),

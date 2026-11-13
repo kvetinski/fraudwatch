@@ -29,7 +29,9 @@ DATABASE_URL = os.getenv(
     "postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch?sslmode=disable",
 )
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
-API_URL = os.getenv("FRAUDWATCH_INGEST_URL", "http://127.0.0.1:8080/transactions")
+API_URL = os.getenv(
+    "FRAUDWATCH_INGEST_URL", "http://127.0.0.1:8080/v1/transactions"
+)
 TIMEOUT_S = int(os.getenv("FRAUDWATCH_SMOKE_TIMEOUT", "120"))
 
 
@@ -114,7 +116,7 @@ def main():
             conn,
             """
             SELECT id, error_type, status
-            FROM scoring_quarantine
+            FROM event_quarantine
             WHERE source_topic = 'transactions.v1'
               AND source_partition = %s AND source_offset = %s
               AND kafka_key = %s AND kafka_payload = %s
@@ -143,13 +145,15 @@ def main():
         )
         print("Corrected transaction durably scored", flush=True)
 
+        run_cli("reconcile", qid)
+
         run_cli(
             "resolve", qid, "--note",
             "Synthetic negative-amount event corrected via Go API and scored",
         )
 
         record = conn.execute(
-            "SELECT status, resolved_at FROM scoring_quarantine WHERE id=%s",
+            "SELECT status, resolved_at FROM event_quarantine WHERE id=%s",
             (qid,),
         ).fetchone()
         decision_count = conn.execute(
@@ -161,7 +165,7 @@ def main():
         audit = conn.execute(
             """
             SELECT action, replacement_transaction_id
-            FROM scoring_quarantine_audit
+            FROM event_quarantine_audit
             WHERE quarantine_id=%s ORDER BY id DESC LIMIT 1
             """,
             (qid,),

@@ -58,8 +58,11 @@ The main processing path is:
   with a different payload returns `409 Conflict`.
 - Outbox publication can be retried. Consumer-side idempotency prevents an
   already stored transaction from creating a duplicate decision.
-- Deterministically malformed transaction messages are written to the durable
-  `scoring_quarantine` table before their offsets are acknowledged.
+- Deterministically invalid transaction and label records are written to the
+  durable `event_quarantine` ledger before their offsets are acknowledged.
+  The ledger preserves Kafka coordinates, original bytes, a SHA-256 digest,
+  stable reason code, status, and operator audit history. PostgreSQL is the
+  dead-letter source of truth; there is no second Kafka dead-letter topic.
 - A late event that would invalidate a terminal's feature history is
   quarantined and creates a durable terminal-order block in the same database
   transaction. Later events for that terminal are quarantined; unrelated
@@ -262,8 +265,8 @@ local environment. Do not expose these services publicly.
 
 ## Quarantine operations
 
-The operator CLI supports inspection, explicit ignore, corrected resubmission,
-and audited resolution:
+The operator CLI supports inspection, explicit ignore, leased transaction
+resubmission, reconciliation, audited resolution, and payload retention:
 
 ```bash
 .venv/bin/python scripts/quarantine.py list
@@ -282,15 +285,29 @@ through the ingestion API and outbox, never directly to Kafka:
   --file corrected.json \
   --url http://127.0.0.1:8080/v1/transactions
 
+.venv/bin/python scripts/quarantine.py reconcile 1
+
 .venv/bin/python scripts/quarantine.py resolve 1 \
   --note 'replacement verified and scored'
 ```
 
-Submission intent is recorded before the HTTP request. Network failures are not
-retried automatically because the API may already have accepted the event.
-Resolution is allowed only after the matching replacement is present in the
-required PostgreSQL records. `ignored` or `resolved` quarantine state does not
-remove a terminal-order block; these are separate safety controls.
+Submission intent and a bounded lease are recorded before the HTTP request.
+After a process crash or uncertain network result, wait for the lease to expire
+and run `reconcile`; it checks the Go transaction, outbox, scored-transaction,
+and decision records. A retry is allowed only when reconciliation proves that
+none of those durable effects exist. Resolution requires a delivered outbox
+event, matching payload hashes, and complete scoring state.
+
+Pending records always retain their original payload. Purge raw payloads for
+resolved or ignored records only after the minimum 30-day retention period:
+
+```bash
+.venv/bin/python scripts/quarantine.py purge --older-than-days 30
+```
+
+The source SHA-256 digest and every audit entry remain after payload purging.
+`ignored` or `resolved` quarantine state does not remove a terminal-order block;
+these are separate safety controls.
 
 For a real local lifecycle smoke test, keep the API and scoring worker running:
 
@@ -369,10 +386,6 @@ logs, and secrets are excluded from Git.
 
 The baseline is intentionally explicit about its remaining gaps:
 
-- The quarantine CLI and lifecycle smoke script still default to the obsolete
-  `/transactions` route. Pass `/v1/transactions` explicitly as shown above.
-- A poison label record currently terminates the label worker; it has no durable
-  label dead-letter path yet.
 - Terminal-order recovery, historical reconciliation, and audited unblock are
   manual and incomplete.
 - Consumer concurrency, sustained throughput, backpressure, crash recovery, and

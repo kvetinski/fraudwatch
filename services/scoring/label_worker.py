@@ -7,6 +7,7 @@ from confluent_kafka import Consumer, KafkaException
 
 from fraudwatch_ml.labels import store_label
 from fraudwatch_ml.observability import LabelMetrics, start_worker_metrics
+from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
 
 
 DATABASE_URL = os.getenv(
@@ -18,6 +19,39 @@ DATABASE_URL = os.getenv(
 KAFKA_BROKERS = os.getenv(
     "KAFKA_BROKERS", "localhost:9092"
 )
+
+
+def process_and_commit(conn, consumer, msg):
+    """Persist a label or its quarantine record before committing its offset."""
+    started = perf_counter()
+    quarantined = False
+    try:
+        payload = msg.value()
+        if payload is None:
+            raise InvalidLabel(
+                "Kafka tombstone is not a fraud label",
+                reason_code="label.tombstone",
+            )
+        inserted = store_label(conn, payload, kafka_key=msg.key())
+    except InvalidLabel as exc:
+        inserted = False
+        store_quarantined(
+            conn,
+            source_topic=msg.topic(),
+            source_partition=msg.partition(),
+            source_offset=msg.offset(),
+            kafka_key=msg.key(),
+            kafka_payload=msg.value(),
+            error=exc,
+        )
+        quarantined = True
+    durable = perf_counter()
+
+    committed = consumer.commit(message=msg, asynchronous=False)
+    if not committed or any(part.error is not None for part in committed):
+        raise RuntimeError(f"Label Kafka offset commit failed: {committed}")
+    acknowledged = perf_counter()
+    return inserted, quarantined, durable - started, acknowledged - durable
 
 
 def main():
@@ -55,27 +89,25 @@ def main():
                     raise KafkaException(msg.error())
 
                 try:
-                    t0 = perf_counter()
-                    inserted = store_label(conn, msg.value())
-                    t1 = perf_counter()
-
-                    # Do not acknowledge before PostgreSQL is durable.
-                    committed = consumer.commit(message=msg, asynchronous=False)
-                    if not committed or any(p.error is not None for p in committed):
-                        raise RuntimeError(f"Label Kafka offset commit failed: {committed}")
-                    t2 = perf_counter()
+                    inserted, quarantined, db_seconds, commit_seconds = (
+                        process_and_commit(conn, consumer, msg)
+                    )
                 except Exception:
                     metrics.errors.labels(category="process").inc()
                     raise
                 metrics.observe_result(
-                    inserted=inserted, db_seconds=t1-t0, commit_seconds=t2-t1,
+                    inserted=inserted,
+                    quarantined=quarantined,
+                    db_seconds=db_seconds,
+                    commit_seconds=commit_seconds,
                 )
 
                 print(
                     f"label processed: "
                     f"partition={msg.partition()} "
                     f"offset={msg.offset()} "
-                    f"new_label={inserted}",
+                    f"new_label={inserted} "
+                    f"quarantined={quarantined}",
                     flush=True,
                 )
 

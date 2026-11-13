@@ -63,7 +63,7 @@ class CheckedCommit:
             with psycopg.connect(self.dsn) as other:
                 saved = other.execute(
                     """
-                    SELECT count(*) FROM scoring_quarantine
+                    SELECT count(*) FROM event_quarantine
                     WHERE source_topic = %s AND source_partition = %s
                       AND source_offset = %s
                     """,
@@ -120,7 +120,7 @@ def test_late_event_quarantines_and_blocks_only_its_terminal():
                 qrows = observer.execute(
                     """
                     SELECT source_offset, error_type, status
-                    FROM scoring_quarantine
+                    FROM event_quarantine
                     WHERE source_topic = 'transactions.v1'
                       AND source_partition = 1
                       AND source_offset = ANY(%s)
@@ -150,7 +150,19 @@ def test_late_event_quarantines_and_blocks_only_its_terminal():
             conn.execute("DELETE FROM terminal_order_blocks WHERE terminal_id = %s", (a,))
             conn.execute(
                 """
-                DELETE FROM scoring_quarantine
+                DELETE FROM event_quarantine_audit
+                WHERE quarantine_id IN (
+                    SELECT id FROM event_quarantine
+                    WHERE source_topic = 'transactions.v1'
+                      AND source_partition = 1
+                      AND source_offset = ANY(%s)
+                )
+                """,
+                ([late.offset(), later.offset()],),
+            )
+            conn.execute(
+                """
+                DELETE FROM event_quarantine
                 WHERE source_topic = 'transactions.v1'
                   AND source_partition = 1
                   AND source_offset = ANY(%s)

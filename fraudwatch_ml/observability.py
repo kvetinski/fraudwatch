@@ -114,13 +114,24 @@ class LabelMetrics:
             "Label worker failures",
             labelnames=("category",), registry=registry,
         )
-        for outcome in ("inserted", "duplicate"):
+        for outcome in ("inserted", "duplicate", "quarantined"):
             self.events.labels(outcome=outcome)
         for category in ("poll", "process"):
             self.errors.labels(category=category)
 
-    def observe_result(self, *, inserted: bool, db_seconds: float, commit_seconds: float) -> None:
-        self.events.labels(outcome="inserted" if inserted else "duplicate").inc()
+    def observe_result(
+        self,
+        *,
+        inserted: bool,
+        quarantined: bool = False,
+        db_seconds: float,
+        commit_seconds: float,
+    ) -> None:
+        if quarantined:
+            outcome = "quarantined"
+        else:
+            outcome = "inserted" if inserted else "duplicate"
+        self.events.labels(outcome=outcome).inc()
         self.duration.labels(stage="database").observe(db_seconds)
         self.duration.labels(stage="kafka_commit").observe(commit_seconds)
         self.duration.labels(stage="total").observe(db_seconds + commit_seconds)
@@ -135,7 +146,8 @@ def refresh_scoring_snapshot(metrics: ScoringMetrics, conn, consumer) -> None:
     pending, blocked = conn.execute(
         """
         SELECT
-          (SELECT count(*) FROM scoring_quarantine WHERE status = 'pending'),
+          (SELECT count(*) FROM event_quarantine
+           WHERE status = 'pending' AND event_type = 'transaction'),
           (SELECT count(*) FROM terminal_order_blocks)
         """
     ).fetchone()

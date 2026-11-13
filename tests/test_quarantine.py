@@ -4,6 +4,7 @@ Database integration tests run when TEST_DATABASE_URL is configured by make test
 """
 
 import json
+import hashlib
 import os
 import uuid
 
@@ -156,12 +157,32 @@ def test_postgres_quarantine_is_durable_and_idempotent():
             # Check from a different connection: the transaction is committed.
             with psycopg.connect(dsn) as other:
                 row = other.execute(
-                    """SELECT kafka_key, kafka_payload, status
-                       FROM scoring_quarantine
+                    """SELECT kafka_key, kafka_payload, status, event_type,
+                              reason_code, source_payload_sha256
+                       FROM event_quarantine
                        WHERE source_topic=%s AND source_partition=%s AND source_offset=%s""",
                     ("transactions.v1", 2, source_offset),
                 ).fetchone()
-                assert row == (b"test-terminal", b"{bad", "pending")
+                assert row == (
+                    b"test-terminal",
+                    b"{bad",
+                    "pending",
+                    "transaction",
+                    "transaction.invalid",
+                    hashlib.sha256(b"{bad").digest(),
+                )
+                audit = other.execute(
+                    """
+                    SELECT action FROM event_quarantine_audit
+                    WHERE quarantine_id = (
+                        SELECT id FROM event_quarantine
+                        WHERE source_topic=%s AND source_partition=%s
+                          AND source_offset=%s
+                    )
+                    """,
+                    ("transactions.v1", 2, source_offset),
+                ).fetchall()
+                assert audit == [("quarantined",)]
 
             assert store_quarantined(conn, **kwargs) is False
             with pytest.raises(RuntimeError, match="different bytes"):
@@ -169,14 +190,25 @@ def test_postgres_quarantine_is_durable_and_idempotent():
 
             # Failed conflicting insert must not modify the original row.
             count = conn.execute(
-                """SELECT count(*) FROM scoring_quarantine
+                """SELECT count(*) FROM event_quarantine
                    WHERE source_topic=%s AND source_partition=%s AND source_offset=%s""",
                 ("transactions.v1", 2, source_offset),
             ).fetchone()[0]
             assert count == 1
         finally:
             conn.execute(
-                """DELETE FROM scoring_quarantine
+                """
+                DELETE FROM event_quarantine_audit
+                WHERE quarantine_id IN (
+                    SELECT id FROM event_quarantine
+                    WHERE source_topic=%s AND source_partition=%s
+                      AND source_offset=%s
+                )
+                """,
+                ("transactions.v1", 2, source_offset),
+            )
+            conn.execute(
+                """DELETE FROM event_quarantine
                    WHERE source_topic=%s AND source_partition=%s AND source_offset=%s""",
                 ("transactions.v1", 2, source_offset),
             )
@@ -195,7 +227,7 @@ def test_actual_db_commit_happens_before_kafka_ack():
             # Use a separate connection to prove the row is visible before ack.
             with psycopg.connect(dsn) as verifier:
                 assert verifier.execute(
-                    """SELECT count(*) FROM scoring_quarantine
+                    """SELECT count(*) FROM event_quarantine
                        WHERE source_topic = %s AND source_partition = %s
                        AND source_offset = %s""",
                     (message.topic(), message.partition(), message.offset()),
@@ -208,7 +240,18 @@ def test_actual_db_commit_happens_before_kafka_ack():
             assert consumer.commits == 1
         finally:
             conn.execute(
-                """DELETE FROM scoring_quarantine
+                """
+                DELETE FROM event_quarantine_audit
+                WHERE quarantine_id IN (
+                    SELECT id FROM event_quarantine
+                    WHERE source_topic=%s AND source_partition=%s
+                      AND source_offset=%s
+                )
+                """,
+                (msg.topic(), msg.partition(), msg.offset()),
+            )
+            conn.execute(
+                """DELETE FROM event_quarantine
                    WHERE source_topic=%s AND source_partition=%s AND source_offset=%s""",
                 (msg.topic(), msg.partition(), msg.offset()),
             )
@@ -244,7 +287,7 @@ def test_offset_commit_failure_can_be_retried_idempotently():
                 worker.process_and_commit(conn, None, FailedCommit(), msg)
 
             saved = conn.execute(
-                """SELECT count(*) FROM scoring_quarantine
+                """SELECT count(*) FROM event_quarantine
                    WHERE source_topic = %s AND source_partition = %s
                      AND source_offset = %s""",
                 (msg.topic(), msg.partition(), msg.offset()),
@@ -256,7 +299,7 @@ def test_offset_commit_failure_can_be_retried_idempotently():
             assert quarantined and consumer.commits == 1
 
             saved_again = conn.execute(
-                """SELECT count(*) FROM scoring_quarantine
+                """SELECT count(*) FROM event_quarantine
                    WHERE source_topic = %s AND source_partition = %s
                      AND source_offset = %s""",
                 (msg.topic(), msg.partition(), msg.offset()),
@@ -264,7 +307,18 @@ def test_offset_commit_failure_can_be_retried_idempotently():
             assert saved_again == 1
         finally:
             conn.execute(
-                """DELETE FROM scoring_quarantine
+                """
+                DELETE FROM event_quarantine_audit
+                WHERE quarantine_id IN (
+                    SELECT id FROM event_quarantine
+                    WHERE source_topic = %s AND source_partition = %s
+                      AND source_offset = %s
+                )
+                """,
+                (msg.topic(), msg.partition(), msg.offset()),
+            )
+            conn.execute(
+                """DELETE FROM event_quarantine
                    WHERE source_topic = %s AND source_partition = %s
                      AND source_offset = %s""",
                 (msg.topic(), msg.partition(), msg.offset()),

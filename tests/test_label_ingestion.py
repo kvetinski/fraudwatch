@@ -2,10 +2,13 @@ import json
 import os
 import uuid
 
+import pandas as pd
 import psycopg
 import pytest
 
 from fraudwatch_ml.labels import store_label
+from fraudwatch_ml.labels import resolve_pending_label
+from fraudwatch_ml.locks import lock_terminal, lock_transaction
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 
 
@@ -17,6 +20,7 @@ def test_label_before_transaction_and_idempotency():
 
     transaction_id = f"label-test-{uuid.uuid4().hex}"
     terminal_id = f"terminal-{uuid.uuid4().hex}"
+    source_offset = uuid.uuid4().int % (2**62)
 
     payload = json.dumps({
         "transaction_id": transaction_id,
@@ -27,10 +31,33 @@ def test_label_before_transaction_and_idempotency():
     with psycopg.connect(dsn, autocommit=True) as conn:
         try:
             # Label arrives before the transaction.
-            assert store_label(conn, payload) is True
+            assert store_label(
+                conn,
+                payload,
+                kafka_key=transaction_id.encode(),
+                source_topic="fraud-labels.v1",
+                source_partition=1,
+                source_offset=source_offset,
+            ) is True
+
+            assert conn.execute(
+                "SELECT count(*) FROM pending_fraud_labels WHERE transaction_id = %s",
+                (transaction_id,),
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT count(*) FROM fraud_labels WHERE transaction_id = %s",
+                (transaction_id,),
+            ).fetchone()[0] == 0
 
             # Identical replay must not create a duplicate.
-            assert store_label(conn, payload) is False
+            assert store_label(
+                conn,
+                payload,
+                kafka_key=transaction_id.encode(),
+                source_topic="fraud-labels.v1",
+                source_partition=1,
+                source_offset=source_offset,
+            ) is False
 
             conflicting = json.dumps({
                 "transaction_id": transaction_id,
@@ -39,23 +66,40 @@ def test_label_before_transaction_and_idempotency():
             }).encode()
 
             with pytest.raises(ValueError):
-                store_label(conn, conflicting)
-
-            conn.execute(
-                """
-                INSERT INTO scored_transactions (
-                    transaction_id,
-                    terminal_id,
-                    occurred_at
+                store_label(
+                    conn,
+                    conflicting,
+                    kafka_key=transaction_id.encode(),
+                    source_topic="fraud-labels.v1",
+                    source_partition=1,
+                    source_offset=source_offset + 1,
                 )
-                VALUES (%s, %s, %s)
-                """,
-                (
-                    transaction_id,
-                    terminal_id,
-                    "2018-04-01T00:00:00Z",
-                ),
-            )
+
+            with conn.transaction():
+                lock_transaction(conn, transaction_id)
+                lock_terminal(conn, terminal_id)
+                conn.execute(
+                    """
+                    INSERT INTO scored_transactions (
+                        transaction_id,
+                        terminal_id,
+                        occurred_at
+                    )
+                    VALUES (%s, %s, %s)
+                    """,
+                    (
+                        transaction_id,
+                        terminal_id,
+                        "2018-04-01T00:00:00Z",
+                    ),
+                )
+                assert resolve_pending_label(
+                    conn,
+                    transaction_id=transaction_id,
+                    occurred_at=pd.Timestamp(
+                        "2018-04-01T00:00:00Z"
+                    ).to_pydatetime(),
+                ) == "activated"
 
             history = PostgresTerminalHistory(conn)
 
@@ -83,6 +127,13 @@ def test_label_before_transaction_and_idempotency():
             conn.execute(
                 """
                 DELETE FROM fraud_labels
+                WHERE transaction_id = %s
+                """,
+                (transaction_id,),
+            )
+            conn.execute(
+                """
+                DELETE FROM pending_fraud_labels
                 WHERE transaction_id = %s
                 """,
                 (transaction_id,),

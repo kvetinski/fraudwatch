@@ -112,7 +112,7 @@ def test_label_infrastructure_failure_does_not_advance_offset(monkeypatch):
 
 
 def test_poison_label_does_not_prevent_following_record(monkeypatch):
-    def store(conn, payload, *, kafka_key):
+    def store(conn, payload, *, kafka_key, **source):
         if payload == b"poison":
             raise InvalidLabel("poison", reason_code="label.contract_violation")
         return True

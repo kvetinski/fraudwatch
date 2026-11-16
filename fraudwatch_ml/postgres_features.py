@@ -20,45 +20,58 @@ class PostgresTerminalHistory:
         else:
             at = at.tz_convert("UTC")
 
+        # Compute every window in one PostgreSQL statement. The statement uses
+        # one MVCC snapshot, so concurrent label activation cannot make the 7d
+        # and 30d features observe different database states.
+        rows = self.connection.execute(
+            """
+            WITH parameters AS (
+                SELECT %s::timestamptz AS feature_at,
+                       %s::integer AS delay_days
+            ), windows AS (
+                SELECT window_days, ordinal
+                FROM unnest(%s::integer[]) WITH ORDINALITY
+                    AS configured(window_days, ordinal)
+            )
+            SELECT
+                windows.ordinal,
+                count(st.transaction_id) AS tx_count,
+                count(st.transaction_id) FILTER (
+                    WHERE
+                        COALESCE(fl.fraud_label, st.fraud_label) = 1
+                        AND COALESCE(
+                            fl.observed_at,
+                            st.label_observed_at
+                        ) <= parameters.feature_at
+                ) AS fraud_count
+            FROM windows
+            CROSS JOIN parameters
+            LEFT JOIN scored_transactions AS st
+                ON st.terminal_id = %s
+               AND st.occurred_at >= parameters.feature_at - make_interval(
+                    days => parameters.delay_days + windows.window_days
+               )
+               AND st.occurred_at <= parameters.feature_at - make_interval(
+                    days => parameters.delay_days
+               )
+            LEFT JOIN fraud_labels AS fl
+                ON fl.transaction_id = st.transaction_id
+            GROUP BY windows.ordinal
+            ORDER BY windows.ordinal
+            """,
+            (
+                at.to_pydatetime(),
+                LABEL_DELAY_DAYS,
+                list(TERMINAL_WINDOWS_DAYS),
+                terminal_id,
+            ),
+        ).fetchall()
+
+        if len(rows) != len(TERMINAL_WINDOWS_DAYS):
+            raise RuntimeError("PostgreSQL returned an incomplete history snapshot")
+
         values = []
-
-        for window in TERMINAL_WINDOWS_DAYS:
-            lower = at - pd.Timedelta(
-                days=LABEL_DELAY_DAYS + window
-            )
-            upper = at - pd.Timedelta(
-                days=LABEL_DELAY_DAYS
-            )
-
-            row = self.connection.execute(
-                """
-                SELECT
-                    count(*) AS tx_count,
-                    count(*) FILTER (
-                        WHERE
-                            COALESCE(fl.fraud_label, st.fraud_label) = 1
-                            AND COALESCE(
-                                fl.observed_at,
-                                st.label_observed_at
-                            ) <= %s
-                    ) AS fraud_count
-                FROM scored_transactions AS st
-                LEFT JOIN fraud_labels AS fl
-                    ON fl.transaction_id = st.transaction_id
-                WHERE st.terminal_id = %s
-                AND st.occurred_at >= %s
-                AND st.occurred_at <= %s
-                """,
-                (
-                    at.to_pydatetime(),
-                    terminal_id,
-                    lower.to_pydatetime(),
-                    upper.to_pydatetime(),
-                ),
-            ).fetchone()
-
-            count, frauds = row
-
+        for _, count, frauds in rows:
             values.extend([
                 count,
                 frauds,

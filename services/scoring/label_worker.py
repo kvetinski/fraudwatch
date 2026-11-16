@@ -1,4 +1,5 @@
 
+import logging
 import os
 from time import perf_counter
 
@@ -8,6 +9,14 @@ from confluent_kafka import Consumer, KafkaException
 from fraudwatch_ml.labels import store_label
 from fraudwatch_ml.observability import LabelMetrics, start_worker_metrics
 from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
+from fraudwatch_ml.worker_runtime import (
+    ShutdownController,
+    classify_failure,
+    install_shutdown_handlers,
+)
+
+
+logger = logging.getLogger("fraudwatch.labels")
 
 
 DATABASE_URL = os.getenv(
@@ -32,7 +41,14 @@ def process_and_commit(conn, consumer, msg):
                 "Kafka tombstone is not a fraud label",
                 reason_code="label.tombstone",
             )
-        inserted = store_label(conn, payload, kafka_key=msg.key())
+        inserted = store_label(
+            conn,
+            payload,
+            kafka_key=msg.key(),
+            source_topic=msg.topic(),
+            source_partition=msg.partition(),
+            source_offset=msg.offset(),
+        )
     except InvalidLabel as exc:
         inserted = False
         store_quarantined(
@@ -69,51 +85,68 @@ def main():
     })
 
     consumer.subscribe(["fraud-labels.v1"])
+    shutdown = ShutdownController()
 
     print("Fraud-label consumer started", flush=True)
 
     try:
-        with psycopg.connect(
-            DATABASE_URL,
-            autocommit=True,
-        ) as conn:
+        with install_shutdown_handlers(shutdown):
+            with psycopg.connect(
+                DATABASE_URL,
+                autocommit=True,
+            ) as conn:
 
-            while True:
-                msg = consumer.poll(1.0)
+                while not shutdown.requested:
+                    msg = consumer.poll(1.0)
 
-                if msg is None:
-                    continue
+                    # If shutdown arrived during poll, leave this fetched record
+                    # unacknowledged for the next group member/restart.
+                    if shutdown.requested:
+                        break
 
-                if msg.error():
-                    metrics.errors.labels(category="poll").inc()
-                    raise KafkaException(msg.error())
+                    if msg is None:
+                        continue
 
-                try:
-                    inserted, quarantined, db_seconds, commit_seconds = (
-                        process_and_commit(conn, consumer, msg)
+                    if msg.error():
+                        metrics.errors.labels(category="poll").inc()
+                        raise KafkaException(msg.error())
+
+                    try:
+                        inserted, quarantined, db_seconds, commit_seconds = (
+                            process_and_commit(conn, consumer, msg)
+                        )
+                    except Exception as exc:
+                        category = classify_failure(exc)
+                        metrics.errors.labels(category=category.value).inc()
+                        logger.exception(
+                            "Label worker failure category=%s; offset not advanced",
+                            category.value,
+                        )
+                        raise
+                    metrics.observe_result(
+                        inserted=inserted,
+                        quarantined=quarantined,
+                        db_seconds=db_seconds,
+                        commit_seconds=commit_seconds,
                     )
-                except Exception:
-                    metrics.errors.labels(category="process").inc()
-                    raise
-                metrics.observe_result(
-                    inserted=inserted,
-                    quarantined=quarantined,
-                    db_seconds=db_seconds,
-                    commit_seconds=commit_seconds,
-                )
 
-                print(
-                    f"label processed: "
-                    f"partition={msg.partition()} "
-                    f"offset={msg.offset()} "
-                    f"new_label={inserted} "
-                    f"quarantined={quarantined}",
-                    flush=True,
-                )
+                    print(
+                        f"label processed: "
+                        f"partition={msg.partition()} "
+                        f"offset={msg.offset()} "
+                        f"new_label={inserted} "
+                        f"quarantined={quarantined}",
+                        flush=True,
+                    )
 
     except KeyboardInterrupt:
         print("Stopping label worker")
     finally:
+        if shutdown.requested:
+            print(
+                f"Stopping label worker after signal {shutdown.signal_number}",
+                flush=True,
+            )
         consumer.close()
 
 

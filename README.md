@@ -50,7 +50,9 @@ The main processing path is:
 4. The consumer synchronously commits the Kafka offset only after PostgreSQL
    commits. Database state is authoritative; Kafka delivery is at least once.
 5. A separate consumer persists delayed labels from `fraud-labels.v1`, also
-   committing its Kafka offset only after the database write.
+   committing its Kafka offset only after the database write. A label that
+   arrives before its transaction is staged outside the active feature set;
+   transaction scoring later activates or quarantines it atomically.
 
 ## Reliability behavior
 
@@ -63,14 +65,22 @@ The main processing path is:
   The ledger preserves Kafka coordinates, original bytes, a SHA-256 digest,
   stable reason code, status, and operator audit history. PostgreSQL is the
   dead-letter source of truth; there is no second Kafka dead-letter topic.
+- Label and transaction workers acquire the same transaction-ID lock before a
+  terminal lock. This closes the cross-topic arrival race, and all terminal
+  history windows are calculated in one PostgreSQL statement and snapshot.
 - A late event that would invalidate a terminal's feature history is
   quarantined and creates a durable terminal-order block in the same database
   transaction. Later events for that terminal are quarantined; unrelated
   terminals continue processing.
 - Terminal-order blocks are deliberately fail-closed. There is no automatic
   unblock until reviewed historical reconciliation exists.
-- Infrastructure, model, feature, and database errors remain fatal to the
-  scoring process and leave the current Kafka offset uncommitted.
+- Infrastructure failures are classified separately from model/code failures.
+  Both fail closed without acknowledging the current record; supervised workers
+  can restart and retry transient failures, while model/code failures require
+  investigation.
+- `SIGINT` and `SIGTERM` stop polling for new work. A record already being
+  processed finishes its PostgreSQL-plus-Kafka-commit boundary before the
+  consumer closes; a record fetched after shutdown remains unacknowledged.
 - Metrics are operational signals, not an audit log. PostgreSQL remains the
   source of truth.
 

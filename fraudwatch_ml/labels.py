@@ -1,4 +1,5 @@
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from fraudwatch_ml.contracts import (
@@ -8,7 +9,8 @@ from fraudwatch_ml.contracts import (
     require_rfc3339,
 )
 from fraudwatch_ml.features import LABEL_DELAY_DAYS
-from fraudwatch_ml.quarantine import InvalidLabel
+from fraudwatch_ml.locks import lock_terminal, lock_transaction
+from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
 
 
 _KAFKA_KEY_NOT_PROVIDED = object()
@@ -63,12 +65,25 @@ def store_label(
     payload: bytes,
     *,
     kafka_key: bytes | None | object = _KAFKA_KEY_NOT_PROVIDED,
+    source_topic: str | None = None,
+    source_partition: int | None = None,
+    source_offset: int | None = None,
 ) -> bool:
     """
-    Returns True for a new label, False for an identical retry.
-    Raises ValueError for conflicting or invalid events.
+    Store an active label or stage it until its transaction arrives.
+
+    Returns True for a new logical label and False for an identical retry.
+    Deterministic contract, delay, and conflict errors raise InvalidLabel.
+    Production callers provide all source coordinates so a staged label can be
+    quarantined later if the transaction proves its delay invalid.
     """
     transaction_id, label, observed_at = parse_label(payload)
+    source_coordinates = (source_topic, source_partition, source_offset)
+    if any(value is not None for value in source_coordinates) and not all(
+        value is not None for value in source_coordinates
+    ):
+        raise RuntimeError("Label source coordinates must be provided together")
+
     if kafka_key is not _KAFKA_KEY_NOT_PROVIDED:
         expected_key = transaction_id.encode("utf-8")
         if kafka_key != expected_key:
@@ -78,9 +93,10 @@ def store_label(
             )
 
     with conn.transaction():
+        lock_transaction(conn, transaction_id)
         transaction = conn.execute(
             """
-            SELECT occurred_at
+            SELECT terminal_id, occurred_at
             FROM scored_transactions
             WHERE transaction_id = %s
             """,
@@ -88,35 +104,11 @@ def store_label(
         ).fetchone()
 
         if transaction is not None:
-            earliest = (
-                transaction[0]
-                + timedelta(days=LABEL_DELAY_DAYS)
-            )
+            terminal_id, occurred_at = transaction
+            lock_terminal(conn, terminal_id)
+            _validate_delay(observed_at, occurred_at)
 
-            if observed_at < earliest:
-                raise InvalidLabel(
-                    "Fraud label violates the seven-day delay",
-                    reason_code="label.delay_violation",
-                )
-
-        inserted = conn.execute(
-            """
-            INSERT INTO fraud_labels (
-                transaction_id,
-                fraud_label,
-                observed_at
-            )
-            VALUES (%s, %s, %s)
-            ON CONFLICT (transaction_id) DO NOTHING
-            RETURNING transaction_id
-            """,
-            (transaction_id, label, observed_at),
-        ).fetchone()
-
-        if inserted is not None:
-            return True
-
-        existing = conn.execute(
+        active = conn.execute(
             """
             SELECT fraud_label, observed_at
             FROM fraud_labels
@@ -124,11 +116,168 @@ def store_label(
             """,
             (transaction_id,),
         ).fetchone()
+        pending = conn.execute(
+            """
+            SELECT fraud_label, observed_at
+            FROM pending_fraud_labels
+            WHERE transaction_id = %s
+            """,
+            (transaction_id,),
+        ).fetchone()
 
-        if existing != (label, observed_at):
-            raise InvalidLabel(
-                "Conflicting fraud-label event",
-                reason_code="label.conflict",
+        if active is not None and pending is not None:
+            raise RuntimeError(
+                f"Label is both active and pending: {transaction_id}"
             )
 
-        return False
+        existing = active if active is not None else pending
+        if existing is not None:
+            if existing != (label, observed_at):
+                raise InvalidLabel(
+                    "Conflicting fraud-label event",
+                    reason_code="label.conflict",
+                )
+
+            if active is not None or transaction is None:
+                return False
+
+            # A legacy/deployment-overlap pending row can be activated here.
+            _insert_active_label(conn, transaction_id, label, observed_at)
+            conn.execute(
+                "DELETE FROM pending_fraud_labels WHERE transaction_id = %s",
+                (transaction_id,),
+            )
+            return False
+
+        if transaction is None:
+            normalized_key = (
+                None
+                if kafka_key is _KAFKA_KEY_NOT_PROVIDED
+                else kafka_key
+            )
+            conn.execute(
+                """
+                INSERT INTO pending_fraud_labels (
+                    transaction_id, fraud_label, observed_at,
+                    source_topic, source_partition, source_offset,
+                    kafka_key, kafka_payload, source_payload_sha256
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    transaction_id, label, observed_at,
+                    source_topic, source_partition, source_offset,
+                    normalized_key, payload, hashlib.sha256(payload).digest(),
+                ),
+            )
+            return True
+
+        _insert_active_label(conn, transaction_id, label, observed_at)
+        return True
+
+
+def _validate_delay(observed_at: datetime, occurred_at: datetime) -> None:
+    earliest = occurred_at + timedelta(days=LABEL_DELAY_DAYS)
+    if observed_at < earliest:
+        raise InvalidLabel(
+            "Fraud label violates the seven-day delay",
+            reason_code="label.delay_violation",
+        )
+
+
+def _insert_active_label(
+    conn,
+    transaction_id: str,
+    label: int,
+    observed_at: datetime,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO fraud_labels (
+            transaction_id,
+            fraud_label,
+            observed_at
+        )
+        VALUES (%s, %s, %s)
+        """,
+        (transaction_id, label, observed_at),
+    )
+
+
+def resolve_pending_label(
+    conn,
+    *,
+    transaction_id: str,
+    occurred_at: datetime,
+) -> str | None:
+    """Activate or quarantine one staged label inside the scoring transaction.
+
+    The caller must already hold the transaction-ID lock followed by the
+    terminal lock. The pending-row deletion, activation/quarantine, score, and
+    decision all commit or roll back together.
+    """
+    pending = conn.execute(
+        """
+        SELECT fraud_label, observed_at,
+               source_topic, source_partition, source_offset,
+               kafka_key, kafka_payload, source_payload_sha256
+        FROM pending_fraud_labels
+        WHERE transaction_id = %s
+        """,
+        (transaction_id,),
+    ).fetchone()
+    if pending is None:
+        return None
+
+    (
+        label,
+        observed_at,
+        source_topic,
+        source_partition,
+        source_offset,
+        kafka_key,
+        kafka_payload,
+        source_payload_sha256,
+    ) = pending
+
+    if (
+        kafka_payload is not None
+        and source_payload_sha256 is not None
+        and hashlib.sha256(bytes(kafka_payload)).digest()
+        != bytes(source_payload_sha256)
+    ):
+        raise RuntimeError(
+            f"Pending label payload digest mismatch: {transaction_id}"
+        )
+
+    try:
+        _validate_delay(observed_at, occurred_at)
+    except InvalidLabel as error:
+        if (
+            source_topic is None
+            or source_partition is None
+            or source_offset is None
+            or kafka_payload is None
+        ):
+            raise RuntimeError(
+                "Legacy pending label violates delay but has no recoverable "
+                f"Kafka source: {transaction_id}"
+            ) from error
+        store_quarantined(
+            conn,
+            source_topic=source_topic,
+            source_partition=source_partition,
+            source_offset=source_offset,
+            kafka_key=kafka_key,
+            kafka_payload=bytes(kafka_payload),
+            error=error,
+        )
+        resolution = "quarantined"
+    else:
+        _insert_active_label(conn, transaction_id, label, observed_at)
+        resolution = "activated"
+
+    conn.execute(
+        "DELETE FROM pending_fraud_labels WHERE transaction_id = %s",
+        (transaction_id,),
+    )
+    return resolution

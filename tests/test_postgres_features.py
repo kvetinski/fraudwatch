@@ -11,6 +11,16 @@ from fraudwatch_ml.features import terminal_risk_features
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 
 
+class CountingConnection:
+    def __init__(self, connection):
+        self.connection = connection
+        self.executions = 0
+
+    def execute(self, statement, parameters=None):
+        self.executions += 1
+        return self.connection.execute(statement, parameters)
+
+
 def test_postgres_matches_offline_features():
     dsn = os.getenv("TEST_DATABASE_URL")
 
@@ -69,12 +79,14 @@ def test_postgres_matches_offline_features():
                     ),
                 )
 
-            history = PostgresTerminalHistory(conn)
+            counting = CountingConnection(conn)
+            history = PostgresTerminalHistory(counting)
 
             for i, row in enumerate(df.itertuples(index=False)):
                 at = row.TX_DATETIME.tz_localize("UTC")
 
                 actual = history.features(terminal, at)
+                assert counting.executions == i + 1
 
                 np.testing.assert_allclose(
                     actual,

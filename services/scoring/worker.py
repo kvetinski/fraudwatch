@@ -26,7 +26,9 @@ from confluent_kafka import Consumer, KafkaException
 from mlflow.tracking import MlflowClient
 from psycopg.types.json import Jsonb
 
-from fraudwatch_ml.features import FEATURE_NAMES, LABEL_DELAY_DAYS
+from fraudwatch_ml.features import FEATURE_NAMES
+from fraudwatch_ml.labels import resolve_pending_label
+from fraudwatch_ml.locks import lock_terminal, lock_transaction
 from fraudwatch_ml.contracts import (
     TRANSACTION_FIELDS,
     EventContractError,
@@ -46,6 +48,11 @@ from fraudwatch_ml.scoring import (
     FEATURE_SCHEMA_VERSION,
     Transaction,
     make_feature_frame,
+)
+from fraudwatch_ml.worker_runtime import (
+    ShutdownController,
+    classify_failure,
+    install_shutdown_handlers,
 )
 
 
@@ -238,10 +245,10 @@ def process_event(
 
     t_precheck = perf_counter_ns()
     with conn.transaction():
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (event.terminal_id,),
-        )
+        # All workers use this order: transaction identity, then terminal.
+        # It closes the label/transaction race without introducing a lock cycle.
+        lock_transaction(conn, event.transaction_id)
+        lock_terminal(conn, event.terminal_id)
 
         existing = conn.execute(
             """
@@ -292,21 +299,6 @@ def process_event(
                 source_offset=offset, kafka_key=kafka_key,
                 kafka_payload=payload,
             )
-
-        staged_label = conn.execute(
-            """
-            SELECT observed_at
-            FROM fraud_labels
-            WHERE transaction_id = %s
-            """,
-            (event.transaction_id,),
-        ).fetchone()
-        if staged_label is not None:
-            earliest = occurred_at + pd.Timedelta(days=LABEL_DELAY_DAYS)
-            if pd.Timestamp(staged_label[0]) < earliest:
-                raise ValueError(
-                    f"Staged label violates the label delay: {event.transaction_id}"
-                )
 
         timings.add("prechecks", perf_counter_ns() - t_precheck)
 
@@ -359,6 +351,17 @@ def process_event(
             """,
             (event.transaction_id, event.terminal_id, occurred_at.to_pydatetime()),
         )
+        pending_label = resolve_pending_label(
+            conn,
+            transaction_id=event.transaction_id,
+            occurred_at=occurred_at.to_pydatetime(),
+        )
+        if pending_label is not None:
+            logger.info(
+                "Pending label %s: transaction_id=%s",
+                pending_label,
+                event.transaction_id,
+            )
 
     # The PG transaction has committed successfully when this point is reached.
     timings.add("write_commit", perf_counter_ns() - t_write)
@@ -493,6 +496,7 @@ def main() -> None:
         }
     )
     consumer.subscribe([KAFKA_TOPIC])
+    shutdown = ShutdownController()
     logger.info("Scoring consumer started: topic=%s group=%s", KAFKA_TOPIC, KAFKA_GROUP_ID)
 
     processed = 0
@@ -502,46 +506,56 @@ def main() -> None:
     next_snapshot = 0.0
 
     try:
-        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-            while True:
-                if monotonic() >= next_snapshot:
+        with install_shutdown_handlers(shutdown):
+            with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+                while not shutdown.requested:
+                    if monotonic() >= next_snapshot:
+                        try:
+                            refresh_scoring_snapshot(metrics, conn, consumer)
+                        except Exception as exc:
+                            metrics.snapshot_errors.inc()
+                            logger.warning("Monitoring snapshot failed: %s", exc)
+                        next_snapshot = monotonic() + 15.0
+                    msg = consumer.poll(1.0)
+                    # Do not begin another database transaction after shutdown.
+                    # A record fetched by this poll remains unacknowledged.
+                    if shutdown.requested:
+                        break
+                    if msg is None:
+                        continue
+                    if msg.error():
+                        metrics.errors.labels(category="poll").inc()
+                        raise KafkaException(msg.error())
+                    timings = EventTimings()
                     try:
-                        refresh_scoring_snapshot(metrics, conn, consumer)
+                        new_decision, quarantined, processing_ns, commit_ns = process_and_commit(
+                            conn, scorer, consumer, msg, timings=timings, metrics=metrics,
+                        )
                     except Exception as exc:
-                        metrics.snapshot_errors.inc()
-                        logger.warning("Monitoring snapshot failed: %s", exc)
-                    next_snapshot = monotonic() + 15.0
-                msg = consumer.poll(1.0)
-                if msg is None:
-                    continue
-                if msg.error():
-                    metrics.errors.labels(category="poll").inc()
-                    raise KafkaException(msg.error())
-                timings = EventTimings()
-                try:
-                    new_decision, quarantined, processing_ns, commit_ns = process_and_commit(
-                        conn, scorer, consumer, msg, timings=timings, metrics=metrics,
+                        category = classify_failure(exc)
+                        metrics.errors.labels(category=category.value).inc()
+                        logger.exception(
+                            "Scoring failure category=%s; offset not advanced",
+                            category.value,
+                        )
+                        raise
+                    metrics.observe_result(
+                        new_decision=bool(new_decision), quarantined=bool(quarantined),
+                        timings=timings, processing_ns=processing_ns, commit_ns=commit_ns,
                     )
-                except Exception:
-                    metrics.errors.labels(category="process").inc()
-                    raise
-                metrics.observe_result(
-                    new_decision=bool(new_decision), quarantined=bool(quarantined),
-                    timings=timings, processing_ns=processing_ns, commit_ns=commit_ns,
-                )
 
-                processed += 1
-                new_decisions += int(new_decision)
-                quarantined_count += int(quarantined)
-                if new_decision:
-                    timings.add("process_total", processing_ns)
-                    timings.add("kafka_commit", commit_ns)
-                    timings.add("total", processing_ns + commit_ns)
-                    profiler.observe(timings)
+                    processed += 1
+                    new_decisions += int(new_decision)
+                    quarantined_count += int(quarantined)
+                    if new_decision:
+                        timings.add("process_total", processing_ns)
+                        timings.add("kafka_commit", commit_ns)
+                        timings.add("total", processing_ns + commit_ns)
+                        profiler.observe(timings)
 
-                if processed % STATS_EVERY == 0:
-                    logger.info("quarantined_total=%d", quarantined_count)
-                    log_profile(profiler, processed, new_decisions)
+                    if processed % STATS_EVERY == 0:
+                        logger.info("quarantined_total=%d", quarantined_count)
+                        log_profile(profiler, processed, new_decisions)
 
     except KeyboardInterrupt:
         logger.info("Stopping scoring worker")
@@ -551,6 +565,11 @@ def main() -> None:
         )
         raise
     finally:
+        if shutdown.requested:
+            logger.info(
+                "Stopping scoring worker after signal %s",
+                shutdown.signal_number,
+            )
         consumer.close()
 
 

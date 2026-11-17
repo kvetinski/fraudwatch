@@ -10,10 +10,10 @@ app-config: ## Validate combined Compose configuration
 	@$(APP_COMPOSE) config --quiet
 	@echo 'Application Compose configuration: OK'
 
-app-build: ## Build Go API and shared Python worker images
+app-build: ## Build Go API and Python worker images using host build networking
 	@$(APP_COMPOSE) build ingestion scoring
 
-app-up: ## Start containerized API and workers (requires model export, migrations, topics)
+app-up: ## Build via host networking and start the containerized API and workers
 	@test -f artifacts/candidate-model/model/MLmodel || { echo 'Run make app-export-model first' >&2; exit 1; }
 	@$(APP_COMPOSE) up -d --build ingestion scoring labels
 

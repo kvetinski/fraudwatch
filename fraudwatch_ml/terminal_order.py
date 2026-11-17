@@ -38,6 +38,7 @@ def block_for_late_event(
     conn,
     *,
     terminal_id: str,
+    event_ledger_id: int,
     occurred_at: datetime,
     last_scored_at: datetime,
     source_topic: str,
@@ -76,6 +77,9 @@ def block_for_late_event(
     ).fetchone()
     if row is None:
         raise RuntimeError("Durable late-event quarantine record is missing")
+    quarantine_id = row[0]
+
+    _link_valid_event(conn, event_ledger_id, quarantine_id)
 
     conn.execute(
         """
@@ -84,7 +88,7 @@ def block_for_late_event(
         ) VALUES (%s, %s, %s, %s)
         ON CONFLICT (terminal_id) DO NOTHING
         """,
-        (terminal_id, row[0], last_scored_at, occurred_at),
+        (terminal_id, quarantine_id, last_scored_at, occurred_at),
     )
     return TerminalQuarantined(terminal_id, reason, inserted)
 
@@ -93,6 +97,7 @@ def quarantine_blocked_terminal(
     conn,
     *,
     terminal_id: str,
+    event_ledger_id: int,
     source_topic: str,
     source_partition: int,
     source_offset: int,
@@ -110,4 +115,43 @@ def quarantine_blocked_terminal(
         kafka_payload=kafka_payload,
         error=TerminalBlocked(reason),
     )
+    row = conn.execute(
+        """
+        SELECT id FROM event_quarantine
+        WHERE source_topic = %s
+          AND source_partition = %s
+          AND source_offset = %s
+        """,
+        (source_topic, source_partition, source_offset),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Durable blocked-event quarantine record is missing")
+    _link_valid_event(conn, event_ledger_id, row[0])
     return TerminalQuarantined(terminal_id, reason, inserted)
+
+
+def _link_valid_event(conn, event_ledger_id: int, quarantine_id: int) -> None:
+    linked = conn.execute(
+        """
+        INSERT INTO valid_event_quarantine_links (
+            event_ledger_id, quarantine_id
+        ) VALUES (%s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING event_ledger_id
+        """,
+        (event_ledger_id, quarantine_id),
+    ).fetchone()
+    if linked is not None:
+        return
+    existing = conn.execute(
+        """
+        SELECT event_ledger_id, quarantine_id
+        FROM valid_event_quarantine_links
+        WHERE event_ledger_id = %s OR quarantine_id = %s
+        """,
+        (event_ledger_id, quarantine_id),
+    ).fetchone()
+    if isinstance(existing, dict):
+        existing = (existing["event_ledger_id"], existing["quarantine_id"])
+    if existing != (event_ledger_id, quarantine_id):
+        raise RuntimeError("Valid-event quarantine link conflicts")

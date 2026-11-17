@@ -96,6 +96,7 @@ def test_label_before_transaction_and_idempotency():
                 assert resolve_pending_label(
                     conn,
                     transaction_id=transaction_id,
+                    terminal_id=terminal_id,
                     occurred_at=pd.Timestamp(
                         "2018-04-01T00:00:00Z"
                     ).to_pydatetime(),

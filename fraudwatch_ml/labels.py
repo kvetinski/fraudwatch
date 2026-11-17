@@ -1,5 +1,6 @@
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 from fraudwatch_ml.contracts import (
@@ -8,12 +9,35 @@ from fraudwatch_ml.contracts import (
     decode_event_object,
     require_rfc3339,
 )
+from fraudwatch_ml.event_ledger import record_label_event
 from fraudwatch_ml.features import LABEL_DELAY_DAYS
 from fraudwatch_ml.locks import lock_terminal, lock_transaction
 from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
 
 
 _KAFKA_KEY_NOT_PROVIDED = object()
+
+
+def _ledger_payload(
+    transaction_id: str,
+    label: int,
+    observed_at: datetime,
+    raw_payload: bytes | memoryview | None,
+) -> bytes:
+    if raw_payload is not None:
+        return bytes(raw_payload)
+    timestamp = observed_at.astimezone(timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    return json.dumps(
+        {
+            "transaction_id": transaction_id,
+            "fraud_label": label,
+            "observed_at": timestamp,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
 
 
 def parse_label(payload: bytes) -> tuple[str, int, datetime]:
@@ -118,7 +142,9 @@ def store_label(
         ).fetchone()
         pending = conn.execute(
             """
-            SELECT fraud_label, observed_at
+            SELECT fraud_label, observed_at,
+                   source_topic, source_partition, source_offset,
+                   kafka_key, kafka_payload
             FROM pending_fraud_labels
             WHERE transaction_id = %s
             """,
@@ -130,7 +156,11 @@ def store_label(
                 f"Label is both active and pending: {transaction_id}"
             )
 
-        existing = active if active is not None else pending
+        existing = (
+            active
+            if active is not None
+            else pending[:2] if pending is not None else None
+        )
         if existing is not None:
             if existing != (label, observed_at):
                 raise InvalidLabel(
@@ -142,6 +172,20 @@ def store_label(
                 return False
 
             # A legacy/deployment-overlap pending row can be activated here.
+            record_label_event(
+                conn,
+                transaction_id=transaction_id,
+                terminal_id=transaction[0],
+                fraud_label=label,
+                observed_at=observed_at,
+                source_topic=pending[2],
+                source_partition=pending[3],
+                source_offset=pending[4],
+                kafka_key=pending[5],
+                kafka_payload=_ledger_payload(
+                    transaction_id, label, observed_at, pending[6]
+                ),
+            )
             _insert_active_label(conn, transaction_id, label, observed_at)
             conn.execute(
                 "DELETE FROM pending_fraud_labels WHERE transaction_id = %s",
@@ -171,6 +215,20 @@ def store_label(
             )
             return True
 
+        record_label_event(
+            conn,
+            transaction_id=transaction_id,
+            terminal_id=transaction[0],
+            fraud_label=label,
+            observed_at=observed_at,
+            source_topic=source_topic,
+            source_partition=source_partition,
+            source_offset=source_offset,
+            kafka_key=(
+                None if kafka_key is _KAFKA_KEY_NOT_PROVIDED else kafka_key
+            ),
+            kafka_payload=payload,
+        )
         _insert_active_label(conn, transaction_id, label, observed_at)
         return True
 
@@ -207,6 +265,7 @@ def resolve_pending_label(
     conn,
     *,
     transaction_id: str,
+    terminal_id: str,
     occurred_at: datetime,
 ) -> str | None:
     """Activate or quarantine one staged label inside the scoring transaction.
@@ -268,11 +327,27 @@ def resolve_pending_label(
             source_partition=source_partition,
             source_offset=source_offset,
             kafka_key=kafka_key,
-            kafka_payload=bytes(kafka_payload),
+            kafka_payload=_ledger_payload(
+                transaction_id, label, observed_at, kafka_payload
+            ),
             error=error,
         )
         resolution = "quarantined"
     else:
+        record_label_event(
+            conn,
+            transaction_id=transaction_id,
+            terminal_id=terminal_id,
+            fraud_label=label,
+            observed_at=observed_at,
+            source_topic=source_topic,
+            source_partition=source_partition,
+            source_offset=source_offset,
+            kafka_key=kafka_key,
+            kafka_payload=_ledger_payload(
+                transaction_id, label, observed_at, kafka_payload
+            ),
+        )
         _insert_active_label(conn, transaction_id, label, observed_at)
         resolution = "activated"
 

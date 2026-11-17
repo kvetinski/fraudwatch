@@ -26,15 +26,10 @@ from confluent_kafka import Consumer, KafkaException
 from mlflow.tracking import MlflowClient
 from psycopg.types.json import Jsonb
 
+from fraudwatch_ml.event_ledger import record_transaction_event
 from fraudwatch_ml.features import FEATURE_NAMES
 from fraudwatch_ml.labels import resolve_pending_label
 from fraudwatch_ml.locks import lock_terminal, lock_transaction
-from fraudwatch_ml.contracts import (
-    TRANSACTION_FIELDS,
-    EventContractError,
-    decode_event_object,
-    require_rfc3339,
-)
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 from fraudwatch_ml.profiling import EventTimings, RollingProfiler
 from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
@@ -46,9 +41,9 @@ from fraudwatch_ml.terminal_order import (
 )
 from fraudwatch_ml.scoring import (
     FEATURE_SCHEMA_VERSION,
-    Transaction,
     make_feature_frame,
 )
+from fraudwatch_ml.transactions import parse_transaction, validate_transaction_key
 from fraudwatch_ml.worker_runtime import (
     ShutdownController,
     classify_failure,
@@ -114,92 +109,6 @@ def load_scorer() -> LoadedScorer:
     return LoadedScorer(model=model, model_reference=model_reference)
 
 
-def parse_transaction(payload: bytes) -> tuple[Transaction, pd.Timestamp]:
-    """Parse a deterministic transaction schema error into InvalidTransaction.
-
-    InvalidTransaction is the ONLY class automatically sent to quarantine.
-    Do not turn database/model errors or timestamp ordering violations into it.
-    """
-    try:
-        data = decode_event_object(
-            payload,
-            expected_fields=TRANSACTION_FIELDS,
-            event_name="transaction",
-        )
-    except EventContractError as exc:
-        raise InvalidTransaction(
-            str(exc), reason_code="transaction.contract_violation"
-        ) from exc
-
-    transaction_id = data.get("transaction_id")
-    customer_id = data.get("customer_id")
-    terminal_id = data.get("terminal_id")
-    amount = data.get("amount")
-    timestamp = data.get("occurred_at")
-
-    if not isinstance(transaction_id, str) or not transaction_id.strip():
-        raise InvalidTransaction(
-            "Invalid transaction_id",
-            reason_code="transaction.invalid_transaction_id",
-        )
-    if not isinstance(customer_id, str) or not customer_id.strip():
-        raise InvalidTransaction(
-            "Invalid customer_id",
-            reason_code="transaction.invalid_customer_id",
-        )
-    if not isinstance(terminal_id, str) or not terminal_id.strip():
-        raise InvalidTransaction(
-            "Invalid terminal_id",
-            reason_code="transaction.invalid_terminal_id",
-        )
-    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-        raise InvalidTransaction(
-            "Invalid amount", reason_code="transaction.invalid_amount"
-        )
-    try:
-        finite = math.isfinite(amount)
-    except (OverflowError, ValueError, TypeError) as exc:
-        raise InvalidTransaction(
-            "Amount outside supported range",
-            reason_code="transaction.invalid_amount",
-        ) from exc
-    if not finite or amount < 0:
-        raise InvalidTransaction(
-            "Amount must be non-negative and finite",
-            reason_code="transaction.invalid_amount",
-        )
-    try:
-        require_rfc3339(timestamp, field_name="occurred_at")
-        occurred_at = pd.Timestamp(timestamp)
-        occurred_at = occurred_at.tz_convert("UTC")
-    except (EventContractError, ValueError, TypeError, OverflowError) as exc:
-        raise InvalidTransaction(
-            "Invalid occurred_at timestamp",
-            reason_code="transaction.invalid_timestamp",
-        ) from exc
-
-    event = Transaction(
-        transaction_id=transaction_id,
-        terminal_id=terminal_id,
-        timestamp=occurred_at,
-        amount=float(amount),
-    )
-    return event, occurred_at
-
-
-def validate_transaction_key(
-    event: Transaction,
-    kafka_key: bytes | None,
-) -> None:
-    """Require the transaction stream key declared by the v1 contract."""
-    expected = event.terminal_id.encode("utf-8")
-    if kafka_key != expected:
-        raise InvalidTransaction(
-            "Kafka key must equal terminal_id",
-            reason_code="transaction.kafka_key_mismatch",
-        )
-
-
 class MeasuredHistory:
     """Time only the history lookup performed by make_feature_frame()."""
 
@@ -250,6 +159,19 @@ def process_event(
         lock_transaction(conn, event.transaction_id)
         lock_terminal(conn, event.terminal_id)
 
+        event_ledger_id = record_transaction_event(
+            conn,
+            transaction_id=event.transaction_id,
+            terminal_id=event.terminal_id,
+            occurred_at=occurred_at.to_pydatetime(),
+            source_topic=source_topic,
+            source_partition=partition,
+            source_offset=offset,
+            kafka_key=kafka_key,
+            kafka_payload=payload,
+            source_payload_hash=payload_hash,
+        )
+
         existing = conn.execute(
             """
             SELECT source_payload_hash
@@ -276,6 +198,7 @@ def process_event(
         if block is not None:
             return quarantine_blocked_terminal(
                 conn, terminal_id=event.terminal_id,
+                event_ledger_id=event_ledger_id,
                 source_topic=source_topic, source_partition=partition,
                 source_offset=offset, kafka_key=kafka_key,
                 kafka_payload=payload,
@@ -293,6 +216,7 @@ def process_event(
         if latest is not None and occurred_at < pd.Timestamp(latest):
             return block_for_late_event(
                 conn, terminal_id=event.terminal_id,
+                event_ledger_id=event_ledger_id,
                 occurred_at=occurred_at.to_pydatetime(),
                 last_scored_at=pd.Timestamp(latest).to_pydatetime(),
                 source_topic=source_topic, source_partition=partition,
@@ -326,11 +250,38 @@ def process_event(
         t_write = perf_counter_ns()
         conn.execute(
             """
+            INSERT INTO fraud_decision_versions (
+                transaction_id, decision_version, event_ledger_id,
+                terminal_id, occurred_at, fraud_score, model_reference,
+                feature_schema_version, feature_vector, source_payload_hash,
+                kafka_partition, kafka_offset, origin, promoted_at
+            ) VALUES (
+                %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'stream', now()
+            )
+            """,
+            (
+                event.transaction_id,
+                event_ledger_id,
+                event.terminal_id,
+                occurred_at.to_pydatetime(),
+                score,
+                scorer.model_reference,
+                FEATURE_SCHEMA_VERSION,
+                Jsonb(feature_vector),
+                payload_hash,
+                partition,
+                offset,
+            ),
+        )
+        conn.execute(
+            """
             INSERT INTO fraud_decisions (
                 transaction_id, fraud_score, model_reference,
                 feature_schema_version, feature_vector,
-                source_payload_hash, kafka_partition, kafka_offset
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                source_payload_hash, kafka_partition, kafka_offset,
+                decision_version
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
             """,
             (
                 event.transaction_id,
@@ -354,6 +305,7 @@ def process_event(
         pending_label = resolve_pending_label(
             conn,
             transaction_id=event.transaction_id,
+            terminal_id=event.terminal_id,
             occurred_at=occurred_at.to_pydatetime(),
         )
         if pending_label is not None:

@@ -72,8 +72,10 @@ The main processing path is:
   quarantined and creates a durable terminal-order block in the same database
   transaction. Later events for that terminal are quarantined; unrelated
   terminals continue processing.
-- Terminal-order blocks are deliberately fail-closed. There is no automatic
-  unblock until reviewed historical reconciliation exists.
+- Terminal-order blocks are deliberately fail-closed. Valid source events and
+  every decision version are retained. An operator can unblock only after a
+  pinned-model replay verifies source and candidate hashes plus independent
+  feature parity, then atomically promotes the new projection.
 - Infrastructure failures are classified separately from model/code failures.
   Both fail closed without acknowledging the current record; supervised workers
   can restart and retry transient failures, while model/code failures require
@@ -218,6 +220,12 @@ free. The exported candidate model under `artifacts/candidate-model/` is a
 generated, read-only deployment bundle and is intentionally excluded from Git.
 Re-export it whenever the MLflow candidate changes.
 
+Application image builds use the host network for dependency downloads. This
+lets builds follow the Linux host's working DNS and VPN routes when Docker's
+default build bridge cannot reach package repositories. This setting applies
+only to Dockerfile build steps; running containers remain on the isolated
+Compose network.
+
 Inspect or stop only the application containers with:
 
 ```bash
@@ -329,6 +337,52 @@ FRAUDWATCH_INGEST_URL=http://127.0.0.1:8080/v1/transactions \
 The smoke test intentionally leaves resolved quarantine and scored transaction
 records as audit artifacts.
 
+## Terminal reconciliation
+
+Use the dedicated workflow only for a terminal blocked by an out-of-order
+transaction. First freeze the complete transaction and label source under the
+concrete model version currently resolved by the scoring configuration:
+
+```bash
+.venv/bin/python scripts/terminal_reconciliation.py preview TERMINAL_ID \
+  --requested-by "$USER" \
+  --note 'reviewed late-event quarantine'
+```
+
+Save the printed `run_id` and `source_event_sha256`. Replay creates new,
+unpromoted decision versions in event-time and transaction-ID order. It checks
+the online feature builder against an independent calculation before marking
+the run verified:
+
+```bash
+.venv/bin/python scripts/terminal_reconciliation.py replay RUN_ID
+.venv/bin/python scripts/terminal_reconciliation.py show RUN_ID
+```
+
+Review the run and then explicitly confirm the preview hash. Promotion rechecks
+the source and candidate hashes in the same transaction that updates the
+current decision projection, activates valid staged labels, resolves the linked
+ordering quarantines, and removes the terminal block:
+
+```bash
+.venv/bin/python scripts/terminal_reconciliation.py promote RUN_ID \
+  --expected-source-sha256 SOURCE_EVENT_SHA256
+```
+
+Any source change after preview or verification fails closed. Close the stale
+run with an audited reason before creating a fresh preview; this does not
+resolve quarantine or unblock the terminal:
+
+```bash
+.venv/bin/python scripts/terminal_reconciliation.py abandon RUN_ID \
+  --requested-by "$USER" \
+  --note 'source changed; replacing snapshot'
+```
+
+Original decisions remain in `fraud_decision_versions`; `fraud_decisions` is
+only the current projection. Never resolve ordering quarantine manually as a
+substitute for this workflow.
+
 ## Historical replay and evaluation
 
 With both workers active, publish a sampled historical stream and wait for its
@@ -396,8 +450,8 @@ logs, and secrets are excluded from Git.
 
 The baseline is intentionally explicit about its remaining gaps:
 
-- Terminal-order recovery, historical reconciliation, and audited unblock are
-  manual and incomplete.
+- Terminal-order reconciliation is intentionally operator-driven and currently
+  replays one terminal at a time in memory; bulk recovery scheduling is absent.
 - Consumer concurrency, sustained throughput, backpressure, crash recovery, and
   full-dataset replay have not been benchmarked systematically.
 - Monitoring does not yet cover Go ingress, label-consumer lag, Kafka/PostgreSQL

@@ -22,9 +22,10 @@ class FixedModel:
 
 
 class FakeMessage:
-    def __init__(self, payload, key):
+    def __init__(self, payload, key, offset):
         self._payload = payload
         self._key = key
+        self._offset = offset
 
     def topic(self):
         return "transactions.v1"
@@ -33,7 +34,7 @@ class FakeMessage:
         return 0
 
     def offset(self):
-        return 123456789
+        return self._offset
 
     def key(self):
         return self._key
@@ -87,7 +88,11 @@ def test_scoring_recovers_after_db_commit_but_failed_kafka_ack():
             "amount": 0.0,
         }
     ).encode("utf-8")
-    msg = FakeMessage(payload, terminal_id.encode())
+    msg = FakeMessage(
+        payload,
+        terminal_id.encode(),
+        uuid.uuid4().int % (2**61),
+    )
     scorer = LoadedScorer(
         model=FixedModel(),
         model_reference="models:/fraudwatch-hgb/recovery-test",
@@ -130,6 +135,14 @@ def test_scoring_recovers_after_db_commit_but_failed_kafka_ack():
                 (transaction_id,),
             )
             conn.execute(
+                "DELETE FROM fraud_decision_versions WHERE transaction_id = %s",
+                (transaction_id,),
+            )
+            conn.execute(
                 "DELETE FROM scored_transactions WHERE transaction_id = %s",
+                (transaction_id,),
+            )
+            conn.execute(
+                "DELETE FROM valid_event_ledger WHERE transaction_id = %s",
                 (transaction_id,),
             )

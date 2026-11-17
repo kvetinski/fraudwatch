@@ -1,5 +1,7 @@
 # Local Linux deployment overlay. Applied on top of infra/compose.yaml.
 # Relative paths are resolved from infra/, i.e. the FIRST Compose file.
+# Application builds use host networking so dependency downloads follow the
+# host's working DNS/VPN routes. Runtime containers still use Compose networks.
 # Prometheus/Grafana remain managed by infra/compose.observability.yaml,
 # using host networking to scrape loopback-only published worker metrics.
 services:
@@ -16,6 +18,7 @@ services:
     build:
       context: ../services/ingestion
       dockerfile: Dockerfile
+      network: host
     environment:
       DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
       KAFKA_BROKERS: kafka:19092
@@ -40,6 +43,7 @@ services:
     build:
       context: ..
       dockerfile: infra/docker/python.Dockerfile
+      network: host
     command: ["python", "services/scoring/worker.py"]
     environment:
       DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
@@ -74,6 +78,7 @@ services:
     build:
       context: ..
       dockerfile: infra/docker/python.Dockerfile
+      network: host
     command: ["python", "services/scoring/label_worker.py"]
     environment:
       DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable

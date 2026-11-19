@@ -843,7 +843,7 @@ def replay_run(conn, scorer, *, run_id: int) -> ReconciliationRun:
                 raise ReconciliationError(
                     f"Offline feature parity failed for {item.event.transaction_id}"
                 )
-            score = float(scorer.model.predict_proba(frame)[0, 1])
+            score = scorer.predict_probability(actual)
             if not math.isfinite(score) or not 0.0 <= score <= 1.0:
                 raise ReconciliationError(
                     f"Model returned invalid score for {item.event.transaction_id}"

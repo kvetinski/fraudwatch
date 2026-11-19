@@ -8,7 +8,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . /app
-# Required by existing worker instrumentation. Move this to pyproject.toml
-# streaming extras once the project package manifest is confirmed.
-RUN python -m pip install --no-cache-dir '.[mlops,streaming]' 'prometheus-client>=0.20,<1'
+RUN python -m pip install --no-cache-dir '.[mlops,streaming]'
 USER 10001:10001

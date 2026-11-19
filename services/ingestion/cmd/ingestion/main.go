@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -113,6 +114,39 @@ func decodeTransaction(body io.Reader) (Transaction, error) {
 
 func transactionKafkaKey(event Transaction) string {
 	return event.TerminalID
+}
+
+func databasePoolConfig(dsn string) (*pgxpool.Config, error) {
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	readPositive := func(name string, fallback int) (int, error) {
+		value := os.Getenv(name)
+		if value == "" {
+			return fallback, nil
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return 0, fmt.Errorf("%s must be a positive integer", name)
+		}
+		return parsed, nil
+	}
+	maxConnections, err := readPositive("FRAUDWATCH_DB_MAX_CONNS", 20)
+	if err != nil {
+		return nil, err
+	}
+	minConnections, err := readPositive("FRAUDWATCH_DB_MIN_CONNS", 2)
+	if err != nil {
+		return nil, err
+	}
+	if minConnections > maxConnections {
+		return nil, errors.New("FRAUDWATCH_DB_MIN_CONNS exceeds FRAUDWATCH_DB_MAX_CONNS")
+	}
+	config.MaxConns = int32(maxConnections)
+	config.MinConns = int32(minConnections)
+	config.MaxConnIdleTime = 5 * time.Minute
+	return config, nil
 }
 
 // acceptTransaction returns duplicate=true for an identical replay.
@@ -217,7 +251,11 @@ func main() {
 			"127.0.0.1:5434/fraudwatch?sslmode=disable"
 	}
 
-	db, err := pgxpool.New(context.Background(), dsn)
+	poolConfig, err := databasePoolConfig(dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	db, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err != nil {
 		log.Fatal(err)
 	}

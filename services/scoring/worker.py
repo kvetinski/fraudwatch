@@ -13,16 +13,32 @@ import json
 import logging
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter_ns, monotonic
 from typing import Any
 
+# Keep every scoring replica predictable.  Native BLAS/OpenMP fan-out is
+# counterproductive for one-row HGB inference and otherwise multiplies by the
+# number of Kafka consumers.
+NATIVE_MATH_THREADS = int(os.getenv("FRAUDWATCH_NATIVE_MATH_THREADS", "1"))
+if NATIVE_MATH_THREADS < 1:
+    raise ValueError("FRAUDWATCH_NATIVE_MATH_THREADS must be positive")
+for _thread_variable in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[_thread_variable] = str(NATIVE_MATH_THREADS)
+
 import mlflow
 import mlflow.sklearn
+import numpy as np
 import pandas as pd
 import psycopg
-from confluent_kafka import Consumer, KafkaException
+from confluent_kafka import Consumer, KafkaException, TopicPartition
 from mlflow.tracking import MlflowClient
 from psycopg.types.json import Jsonb
 
@@ -41,7 +57,7 @@ from fraudwatch_ml.terminal_order import (
 )
 from fraudwatch_ml.scoring import (
     FEATURE_SCHEMA_VERSION,
-    make_feature_frame,
+    make_feature_vector,
 )
 from fraudwatch_ml.transactions import parse_transaction, validate_transaction_key
 from fraudwatch_ml.worker_runtime import (
@@ -64,6 +80,13 @@ MODEL_NAME = os.getenv("MODEL_NAME", "fraudwatch-hgb")
 MODEL_ALIAS = os.getenv("MODEL_ALIAS", "candidate")
 STATS_EVERY = int(os.getenv("STATS_EVERY", "1000"))
 PROFILE_WINDOW = int(os.getenv("PROFILE_WINDOW", "10000"))
+BATCH_SIZE_PER_PARTITION = int(
+    os.getenv("FRAUDWATCH_SCORING_BATCH_SIZE_PER_PARTITION", "8")
+)
+BATCH_WAIT_SECONDS = float(
+    os.getenv("FRAUDWATCH_SCORING_BATCH_WAIT_SECONDS", "0.025")
+)
+DB_PREPARE_THRESHOLD = int(os.getenv("FRAUDWATCH_DB_PREPARE_THRESHOLD", "1"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +99,40 @@ logger = logging.getLogger("fraudwatch.scoring")
 class LoadedScorer:
     model: Any
     model_reference: str
+    array_inference: bool = False
+
+    def predict_probability(self, values: np.ndarray) -> float:
+        """Score one schema-ordered row using the model's supported input type.
+
+        Persisted production models are validated once and then use the
+        allocation-light ndarray path.  DataFrame input remains available for
+        custom scorers used by reconciliation and tests.
+        """
+        if values.shape != (len(FEATURE_NAMES),):
+            raise ValueError("Unexpected feature schema")
+        if self.array_inference:
+            model_input = values.reshape(1, -1)
+        else:
+            model_input = pd.DataFrame([values], columns=list(FEATURE_NAMES))
+        return float(self.model.predict_proba(model_input)[0, 1])
+
+
+def prepare_model_for_array_inference(model: Any) -> Any:
+    """Validate named training schema once, then use allocation-light arrays.
+
+    HistGradientBoosting uses feature positions after input validation.  Once
+    the persisted feature names are checked here, dropping only that validation
+    metadata prevents a warning on every ndarray prediction.  It does not alter
+    learned parameters or prediction math.
+    """
+    if getattr(model, "n_features_in_", None) != len(FEATURE_NAMES):
+        raise RuntimeError("Model feature count differs from the scoring schema")
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None:
+        if list(names) != list(FEATURE_NAMES):
+            raise RuntimeError("Model feature order differs from the scoring schema")
+        delattr(model, "feature_names_in_")
+    return model
 
 
 def load_scorer() -> LoadedScorer:
@@ -89,12 +146,16 @@ def load_scorer() -> LoadedScorer:
             raise RuntimeError("Exported model name differs from configured MODEL_NAME")
         if manifest.get("feature_names") != list(FEATURE_NAMES):
             raise RuntimeError("Exported model feature order differs from the scoring schema")
-        model = mlflow.sklearn.load_model(str(bundle / "model"))
-        if getattr(model, "n_features_in_", len(FEATURE_NAMES)) != len(FEATURE_NAMES):
-            raise RuntimeError("Exported model feature count differs from the scoring schema")
+        model = prepare_model_for_array_inference(
+            mlflow.sklearn.load_model(str(bundle / "model"))
+        )
         model_reference = manifest["model_reference"]
         logger.info("Loaded portable model: %s", model_reference)
-        return LoadedScorer(model=model, model_reference=model_reference)
+        return LoadedScorer(
+            model=model,
+            model_reference=model_reference,
+            array_inference=True,
+        )
 
     tracking_uri = f"sqlite:///{ROOT / 'mlflow.db'}"
     mlflow.set_tracking_uri(tracking_uri)
@@ -104,13 +165,19 @@ def load_scorer() -> LoadedScorer:
         MODEL_NAME, MODEL_ALIAS
     )
     model_reference = f"models:/{MODEL_NAME}/{version.version}"
-    model = mlflow.sklearn.load_model(model_reference)
+    model = prepare_model_for_array_inference(
+        mlflow.sklearn.load_model(model_reference)
+    )
     logger.info("Loaded model: %s", model_reference)
-    return LoadedScorer(model=model, model_reference=model_reference)
+    return LoadedScorer(
+        model=model,
+        model_reference=model_reference,
+        array_inference=True,
+    )
 
 
 class MeasuredHistory:
-    """Time only the history lookup performed by make_feature_frame()."""
+    """Time only the history lookup performed by make_feature_vector()."""
 
     def __init__(self, base: PostgresTerminalHistory, timings: EventTimings):
         self.base = base
@@ -135,11 +202,13 @@ def process_event(
     source_topic: str = KAFKA_TOPIC,
     kafka_key: bytes | None = None,
     metrics: ScoringMetrics | None = None,
+    batch_transaction: bool = False,
+    committed_scores: list[float] | None = None,
 ) -> bool | TerminalQuarantined:
     """Persist score and historical state atomically; offsets committed by caller.
 
     Stage timings deliberately separate history lookup from the surrounding
-    pandas feature assembly. write_commit includes leaving the PG transaction
+    feature assembly. write_commit includes leaving the PG transaction
     context (COMMIT). Duplicate messages are handled idempotently, but are not
     mixed into the profile of newly scored transactions.
     """
@@ -153,11 +222,13 @@ def process_event(
     timings.add("parse", perf_counter_ns() - t0)
 
     t_precheck = perf_counter_ns()
-    with conn.transaction():
+    transaction = nullcontext() if batch_transaction else conn.transaction()
+    with transaction:
         # All workers use this order: transaction identity, then terminal.
         # It closes the label/transaction race without introducing a lock cycle.
-        lock_transaction(conn, event.transaction_id)
-        lock_terminal(conn, event.terminal_id)
+        if not batch_transaction:
+            lock_transaction(conn, event.transaction_id)
+            lock_terminal(conn, event.terminal_id)
 
         event_ledger_id = record_transaction_event(
             conn,
@@ -228,11 +299,9 @@ def process_event(
 
         measured_history = MeasuredHistory(PostgresTerminalHistory(conn), timings)
         t_features = perf_counter_ns()
-        frame = make_feature_frame(event, measured_history)
-        if list(frame.columns) != list(FEATURE_NAMES) or len(frame) != 1:
+        values = make_feature_vector(event, measured_history)
+        if values.shape != (len(FEATURE_NAMES),):
             raise ValueError("Unexpected feature schema")
-        # Extract a single row once instead of building a pandas Series per key.
-        values = frame.iloc[0].to_numpy(copy=False)
         feature_vector = {
             name: float(value)
             for name, value in zip(FEATURE_NAMES, values)
@@ -242,23 +311,48 @@ def process_event(
         timings.add("feature_build", max(0, feature_elapsed - history_elapsed))
 
         t_infer = perf_counter_ns()
-        score = float(scorer.model.predict_proba(frame)[0, 1])
+        score = scorer.predict_probability(values)
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             raise ValueError(f"Invalid model score: {score}")
         timings.add("inference", perf_counter_ns() - t_infer)
 
         t_write = perf_counter_ns()
-        conn.execute(
+        write_result = conn.execute(
             """
-            INSERT INTO fraud_decision_versions (
-                transaction_id, decision_version, event_ledger_id,
-                terminal_id, occurred_at, fraud_score, model_reference,
-                feature_schema_version, feature_vector, source_payload_hash,
-                kafka_partition, kafka_offset, origin, promoted_at
-            ) VALUES (
-                %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                'stream', now()
+            WITH version_insert AS (
+                INSERT INTO fraud_decision_versions (
+                    transaction_id, decision_version, event_ledger_id,
+                    terminal_id, occurred_at, fraud_score, model_reference,
+                    feature_schema_version, feature_vector,
+                    source_payload_hash, kafka_partition, kafka_offset,
+                    origin, promoted_at
+                ) VALUES (
+                    %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    'stream', now()
+                )
+                RETURNING transaction_id
+            ), decision_insert AS (
+                INSERT INTO fraud_decisions (
+                    transaction_id, fraud_score, model_reference,
+                    feature_schema_version, feature_vector,
+                    source_payload_hash, kafka_partition, kafka_offset,
+                    decision_version
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
+                RETURNING transaction_id
+            ), scored_insert AS (
+                INSERT INTO scored_transactions (
+                    transaction_id, terminal_id, occurred_at
+                ) VALUES (%s, %s, %s)
+                RETURNING transaction_id
             )
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM pending_fraud_labels
+                    WHERE transaction_id = %s
+                ),
+                (SELECT count(*) FROM version_insert),
+                (SELECT count(*) FROM decision_insert),
+                (SELECT count(*) FROM scored_insert)
             """,
             (
                 event.transaction_id,
@@ -272,18 +366,6 @@ def process_event(
                 payload_hash,
                 partition,
                 offset,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO fraud_decisions (
-                transaction_id, fraud_score, model_reference,
-                feature_schema_version, feature_vector,
-                source_payload_hash, kafka_partition, kafka_offset,
-                decision_version
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
-            """,
-            (
                 event.transaction_id,
                 score,
                 scorer.model_reference,
@@ -292,22 +374,23 @@ def process_event(
                 payload_hash,
                 partition,
                 offset,
+                event.transaction_id,
+                event.terminal_id,
+                occurred_at.to_pydatetime(),
+                event.transaction_id,
             ),
-        )
-        conn.execute(
-            """
-            INSERT INTO scored_transactions (
-                transaction_id, terminal_id, occurred_at
-            ) VALUES (%s, %s, %s)
-            """,
-            (event.transaction_id, event.terminal_id, occurred_at.to_pydatetime()),
-        )
-        pending_label = resolve_pending_label(
-            conn,
-            transaction_id=event.transaction_id,
-            terminal_id=event.terminal_id,
-            occurred_at=occurred_at.to_pydatetime(),
-        )
+        ).fetchone()
+        has_pending_label, version_count, decision_count, scored_count = write_result
+        if (version_count, decision_count, scored_count) != (1, 1, 1):
+            raise RuntimeError("Incomplete atomic scoring write")
+        pending_label = None
+        if has_pending_label:
+            pending_label = resolve_pending_label(
+                conn,
+                transaction_id=event.transaction_id,
+                terminal_id=event.terminal_id,
+                occurred_at=occurred_at.to_pydatetime(),
+            )
         if pending_label is not None:
             logger.info(
                 "Pending label %s: transaction_id=%s",
@@ -317,7 +400,9 @@ def process_event(
 
     # The PG transaction has committed successfully when this point is reached.
     timings.add("write_commit", perf_counter_ns() - t_write)
-    if metrics is not None:
+    if committed_scores is not None:
+        committed_scores.append(score)
+    elif metrics is not None:
         metrics.score.observe(score)  # Score was committed to PostgreSQL.
     return True
 
@@ -398,6 +483,202 @@ def process_and_commit(conn, scorer, consumer, msg, timings=None, metrics=None):
     return new_decision, quarantined, t1 - t0, t2 - t1
 
 
+@dataclass
+class DurableMessageResult:
+    """One database-durable result awaiting its partition offset commit."""
+
+    message: Any
+    new_decision: bool
+    quarantined: bool
+    timings: EventTimings
+    started_ns: int
+    durable_ns: int
+
+
+def process_without_kafka_commit(
+    conn,
+    scorer,
+    msg,
+    *,
+    metrics: ScoringMetrics | None = None,
+    batch_transaction: bool = False,
+    committed_scores: list[float] | None = None,
+) -> DurableMessageResult:
+    """Persist one message, leaving its Kafka offset for a batch commit."""
+    started_ns = perf_counter_ns()
+    timings = EventTimings()
+    quarantined = False
+    try:
+        payload = msg.value()
+        if payload is None:
+            raise InvalidTransaction(
+                "Kafka tombstone is not a transaction",
+                reason_code="transaction.tombstone",
+            )
+        outcome = process_event(
+            conn,
+            scorer,
+            payload,
+            msg.partition(),
+            msg.offset(),
+            timings=timings,
+            source_topic=msg.topic(),
+            kafka_key=msg.key(),
+            metrics=metrics,
+            batch_transaction=batch_transaction,
+            committed_scores=committed_scores,
+        )
+        if isinstance(outcome, TerminalQuarantined):
+            logger.warning(
+                "Terminal order quarantine: terminal=%s partition=%s "
+                "offset=%s new_record=%s reason=%s",
+                outcome.terminal_id,
+                msg.partition(),
+                msg.offset(),
+                outcome.new_record,
+                outcome.reason,
+            )
+            quarantined = True
+            new_decision = False
+        else:
+            new_decision = bool(outcome)
+    except InvalidTransaction as exc:
+        inserted = store_quarantined(
+            conn,
+            source_topic=msg.topic(),
+            source_partition=msg.partition(),
+            source_offset=msg.offset(),
+            kafka_key=msg.key(),
+            kafka_payload=msg.value(),
+            error=exc,
+        )
+        logger.warning(
+            "Quarantined record topic=%s partition=%s offset=%s "
+            "new_record=%s reason=%s",
+            msg.topic(),
+            msg.partition(),
+            msg.offset(),
+            inserted,
+            exc,
+        )
+        quarantined = True
+        new_decision = False
+    return DurableMessageResult(
+        message=msg,
+        new_decision=new_decision,
+        quarantined=quarantined,
+        timings=timings,
+        started_ns=started_ns,
+        durable_ns=perf_counter_ns(),
+    )
+
+
+def partition_batches(messages: list[Any]) -> list[list[Any]]:
+    """Return deterministic, offset-ordered batches for each topic partition."""
+    grouped: dict[tuple[str, int], list[Any]] = {}
+    for message in messages:
+        grouped.setdefault((message.topic(), message.partition()), []).append(message)
+    return [
+        sorted(grouped[key], key=lambda message: message.offset())
+        for key in sorted(grouped)
+    ]
+
+
+def persist_scoring_partition_batch(
+    conn,
+    scorer: LoadedScorer,
+    messages: list[Any],
+    *,
+    metrics: ScoringMetrics | None = None,
+) -> list[DurableMessageResult]:
+    """Persist a valid ordered partition batch at one PostgreSQL boundary.
+
+    Contract-invalid input uses the general record-at-a-time path so poison
+    events retain isolated quarantine transactions.  Valid batches acquire
+    every transaction lock before every terminal lock, each set in sorted
+    order, which prevents cross-partition lock cycles.
+    """
+    identities = []
+    try:
+        for message in messages:
+            if message.value() is None:
+                return [
+                    process_without_kafka_commit(conn, scorer, item, metrics=metrics)
+                    for item in messages
+                ]
+            event, _ = parse_transaction(message.value())
+            validate_transaction_key(event, message.key())
+            identities.append((event.transaction_id, event.terminal_id))
+    except InvalidTransaction:
+        return [
+            process_without_kafka_commit(conn, scorer, item, metrics=metrics)
+            for item in messages
+        ]
+
+    transaction_ids = [item[0] for item in identities]
+    if len(set(transaction_ids)) != len(transaction_ids):
+        return [
+            process_without_kafka_commit(conn, scorer, item, metrics=metrics)
+            for item in messages
+        ]
+    terminal_ids = sorted({item[1] for item in identities})
+    committed_scores: list[float] = []
+    with conn.transaction():
+        conn.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('fraudwatch:transaction:' || locked.id, 0)
+            )
+            FROM unnest(%s::text[]) AS locked(id)
+            ORDER BY locked.id
+            """,
+            (sorted(transaction_ids),),
+        ).fetchall()
+        conn.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('fraudwatch:terminal:' || locked.id, 0)
+            )
+            FROM unnest(%s::text[]) AS locked(id)
+            ORDER BY locked.id
+            """,
+            (terminal_ids,),
+        ).fetchall()
+        results = [
+            process_without_kafka_commit(
+                conn,
+                scorer,
+                message,
+                metrics=metrics,
+                batch_transaction=True,
+                committed_scores=committed_scores,
+            )
+            for message in messages
+        ]
+    durable_ns = perf_counter_ns()
+    for result in results:
+        result.durable_ns = durable_ns
+    if metrics is not None:
+        for score in committed_scores:
+            metrics.score.observe(score)
+    return results
+
+
+def commit_partition_batch(consumer, results: list[DurableMessageResult]):
+    """Commit only after every delivered offset in this partition is durable."""
+    if not results:
+        return []
+    last = results[-1].message
+    offsets = [TopicPartition(last.topic(), last.partition(), last.offset() + 1)]
+    committed = consumer.commit(offsets=offsets, asynchronous=False)
+    if not committed:
+        raise RuntimeError("Kafka batch offset commit returned no partitions")
+    errors = [partition.error for partition in committed if partition.error is not None]
+    if errors:
+        raise RuntimeError(f"Kafka batch offset commit failed: {errors}")
+    return committed
+
+
 STAGES = (
     "parse",
     "prechecks",
@@ -431,6 +712,12 @@ def main() -> None:
         raise ValueError("STATS_EVERY must be positive")
     if PROFILE_WINDOW < 1:
         raise ValueError("PROFILE_WINDOW must be positive")
+    if BATCH_SIZE_PER_PARTITION < 1:
+        raise ValueError("FRAUDWATCH_SCORING_BATCH_SIZE_PER_PARTITION must be positive")
+    if not 0 < BATCH_WAIT_SECONDS <= 1:
+        raise ValueError("FRAUDWATCH_SCORING_BATCH_WAIT_SECONDS must be in (0, 1]")
+    if DB_PREPARE_THRESHOLD < 0:
+        raise ValueError("FRAUDWATCH_DB_PREPARE_THRESHOLD must be nonnegative")
 
     scorer = load_scorer()
     metrics = ScoringMetrics()
@@ -459,7 +746,11 @@ def main() -> None:
 
     try:
         with install_shutdown_handlers(shutdown):
-            with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+            with psycopg.connect(
+                DATABASE_URL,
+                autocommit=True,
+                prepare_threshold=DB_PREPARE_THRESHOLD,
+            ) as conn:
                 while not shutdown.requested:
                     if monotonic() >= next_snapshot:
                         try:
@@ -468,46 +759,77 @@ def main() -> None:
                             metrics.snapshot_errors.inc()
                             logger.warning("Monitoring snapshot failed: %s", exc)
                         next_snapshot = monotonic() + 15.0
-                    msg = consumer.poll(1.0)
+                    assigned_partitions = max(1, len(consumer.assignment()))
+                    messages = consumer.consume(
+                        num_messages=min(
+                            1000,
+                            BATCH_SIZE_PER_PARTITION * assigned_partitions,
+                        ),
+                        timeout=BATCH_WAIT_SECONDS,
+                    )
                     # Do not begin another database transaction after shutdown.
-                    # A record fetched by this poll remains unacknowledged.
+                    # Records fetched by this consume remain unacknowledged.
                     if shutdown.requested:
                         break
-                    if msg is None:
+                    if not messages:
                         continue
-                    if msg.error():
-                        metrics.errors.labels(category="poll").inc()
-                        raise KafkaException(msg.error())
-                    timings = EventTimings()
-                    try:
-                        new_decision, quarantined, processing_ns, commit_ns = process_and_commit(
-                            conn, scorer, consumer, msg, timings=timings, metrics=metrics,
-                        )
-                    except Exception as exc:
-                        category = classify_failure(exc)
-                        metrics.errors.labels(category=category.value).inc()
-                        logger.exception(
-                            "Scoring failure category=%s; offset not advanced",
-                            category.value,
-                        )
-                        raise
-                    metrics.observe_result(
-                        new_decision=bool(new_decision), quarantined=bool(quarantined),
-                        timings=timings, processing_ns=processing_ns, commit_ns=commit_ns,
-                    )
+                    for msg in messages:
+                        if msg.error():
+                            metrics.errors.labels(category="poll").inc()
+                            raise KafkaException(msg.error())
 
-                    processed += 1
-                    new_decisions += int(new_decision)
-                    quarantined_count += int(quarantined)
-                    if new_decision:
-                        timings.add("process_total", processing_ns)
-                        timings.add("kafka_commit", commit_ns)
-                        timings.add("total", processing_ns + commit_ns)
-                        profiler.observe(timings)
+                    for partition_messages in partition_batches(messages):
+                        results: list[DurableMessageResult] = []
+                        commit_attempted = False
+                        try:
+                            results = persist_scoring_partition_batch(
+                                conn,
+                                scorer,
+                                partition_messages,
+                                metrics=metrics,
+                            )
+                            commit_attempted = True
+                            commit_partition_batch(consumer, results)
+                            committed_ns = perf_counter_ns()
+                        except Exception as exc:
+                            category = classify_failure(exc)
+                            metrics.errors.labels(category=category.value).inc()
+                            if commit_attempted:
+                                metrics.kafka_commits.labels(result="failure").inc()
+                            logger.exception(
+                                "Scoring failure category=%s; partition batch "
+                                "offset not advanced",
+                                category.value,
+                            )
+                            raise
+                        metrics.kafka_commits.labels(result="success").inc()
 
-                    if processed % STATS_EVERY == 0:
-                        logger.info("quarantined_total=%d", quarantined_count)
-                        log_profile(profiler, processed, new_decisions)
+                        for result in results:
+                            processing_ns = result.durable_ns - result.started_ns
+                            commit_ns = committed_ns - result.durable_ns
+                            metrics.observe_result(
+                                new_decision=result.new_decision,
+                                quarantined=result.quarantined,
+                                timings=result.timings,
+                                processing_ns=processing_ns,
+                                commit_ns=commit_ns,
+                            )
+                            processed += 1
+                            new_decisions += int(result.new_decision)
+                            quarantined_count += int(result.quarantined)
+                            if result.new_decision:
+                                result.timings.add("process_total", processing_ns)
+                                result.timings.add("kafka_commit", commit_ns)
+                                result.timings.add(
+                                    "total", committed_ns - result.started_ns
+                                )
+                                profiler.observe(result.timings)
+
+                        if processed // STATS_EVERY != (
+                            processed - len(results)
+                        ) // STATS_EVERY:
+                            logger.info("quarantined_total=%d", quarantined_count)
+                            log_profile(profiler, processed, new_decisions)
 
     except KeyboardInterrupt:
         logger.info("Stopping scoring worker")
@@ -517,6 +839,9 @@ def main() -> None:
         )
         raise
     finally:
+        if processed:
+            logger.info("quarantined_total=%d", quarantined_count)
+            log_profile(profiler, processed, new_decisions)
         if shutdown.requested:
             logger.info(
                 "Stopping scoring worker after signal %s",

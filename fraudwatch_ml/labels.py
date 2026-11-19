@@ -259,6 +259,19 @@ def _insert_active_label(
         """,
         (transaction_id, label, observed_at),
     )
+    updated = conn.execute(
+        """
+        UPDATE scored_transactions
+        SET fraud_label = %s,
+            label_observed_at = %s
+        WHERE transaction_id = %s
+        """,
+        (label, observed_at, transaction_id),
+    ).rowcount
+    if updated != 1:
+        raise RuntimeError(
+            f"Active label has no scored transaction: {transaction_id}"
+        )
 
 
 def resolve_pending_label(

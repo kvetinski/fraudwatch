@@ -1,0 +1,35 @@
+# Keep the root Python image context source-only. This file is used by the
+# classic Docker builder; the Dockerfile-specific copy documents the same rule.
+.git
+.venv
+.venv/**
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.egg-info
+*.egg-info/**
+*.db
+*.db-*
+*.sqlite*
+*.pkl
+*.parquet
+*.csv
+data
+artifacts
+mlruns
+mlartifacts
+review
+.env
+.env.*
+*.zip
+*.log
+*.bak
+*.pre-*
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+build
+dist
+node_modules

@@ -20,10 +20,16 @@ MLFLOW := .venv/bin/mlflow
 GO_DIR := services/ingestion
 TEST_DATABASE_URL ?= postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch_test?sslmode=disable
 DATA_REPO := https://github.com/Fraud-Detection-Handbook/simulated-data-raw.git
+REPLAY_RUN_ID ?=
+REPLAY_MODE ?= kafka
+REPLAY_ARGS ?=
+EVALUATION_RUN_ID ?=
+EVALUATION_ARGS ?=
 
 .PHONY: help check venv install data kafka-permissions up down stop-all down-all status \
         wait-db init-test-db migrate wait-kafka topics go-deps \
-        model-bootstrap train mlflow-ui smoke run-api run-scoring run-labels \
+        model-bootstrap train mlflow-ui smoke benchmark-replay evaluate-replay \
+        run-api run-scoring run-labels \
         test test-python test-go setup clean clean-all
 
 help: ## Show available commands
@@ -170,6 +176,20 @@ mlflow-ui: venv ## Start MLflow UI on http://127.0.0.1:5001
 
 smoke: venv ## Verify registered model inference
 	@$(PY) scripts/smoke_scoring.py
+
+benchmark-replay: venv ## Run or resume a manifest-backed historical replay
+	@test -n "$(REPLAY_RUN_ID)" || { \
+		echo 'Set REPLAY_RUN_ID to a stable caller-supplied identifier' >&2; exit 2; \
+	}
+	@$(PY) scripts/replay_dataset.py \
+		--run-id "$(REPLAY_RUN_ID)" --mode "$(REPLAY_MODE)" $(REPLAY_ARGS)
+
+evaluate-replay: venv ## Verify a completed 183-day replay and write Phase 3.12 reports
+	@test -n "$(EVALUATION_RUN_ID)" || { \
+		echo 'Set EVALUATION_RUN_ID to a completed unsampled replay ID' >&2; exit 2; \
+	}
+	@$(PY) scripts/evaluate_replay.py \
+		--run-id "$(EVALUATION_RUN_ID)" $(EVALUATION_ARGS)
 
 run-api: ## Run Go ingestion API (requires make setup)
 	@cd "$(GO_DIR)" && go run ./cmd/ingestion

@@ -385,29 +385,95 @@ substitute for this workflow.
 
 ## Historical replay and evaluation
 
-With both workers active, publish a sampled historical stream and wait for its
-transactions and labels to be processed:
+The replay runner requires an explicit, reusable run ID and pins the exact
+dataset files, model bytes, feature schema, and Kafka topology in
+`artifacts/replays/RUN_ID/manifest.json`. Export the candidate model once if the
+portable bundle is not already present, then start both consumers.
+
+Run a bounded direct-to-Kafka scoring-capacity sample:
 
 ```bash
-.venv/bin/python scripts/replay_dataset.py \
-  --days 16 --per-day 1000 --timeout 600
+make app-export-model
+make benchmark-replay \
+  REPLAY_RUN_ID=sample-kafka-v1 \
+  REPLAY_MODE=kafka \
+  REPLAY_ARGS='--days 16 --per-day 1000 --timeout 600'
 ```
 
-Use the replay ID printed by the command:
+For the complete HTTP-to-transactional-outbox-to-Kafka path, also start the Go
+API and select HTTP mode. Events for the same terminal remain ordered while
+different terminals are submitted concurrently:
 
 ```bash
-.venv/bin/python scripts/verify_replay.py \
-  --run-id REPLAY_ID --days 16 --per-day 1000
+make benchmark-replay \
+  REPLAY_RUN_ID=sample-http-v1 \
+  REPLAY_MODE=http \
+  REPLAY_ARGS='--days 16 --per-day 1000 --http-concurrency 16 --timeout 600'
 ```
 
-Do not run host and container scoring workers simultaneously when validating a
-single-worker replay. Consumers in the same Kafka group will divide partitions,
-which changes the intended verification setup.
+Rerun the identical command after an interruption. Completed daily checkpoints
+are skipped; an incomplete day is published again and relies on the normal
+idempotency guarantees. Changing the dataset, model, mode, sampling, or
+topology under an existing run ID is rejected.
 
-The current replay is a deterministic daily sample, not a full-dataset streaming
-evaluation. Its verifier also pins a concrete model version in source. Treat
-full historical evaluation, repeatable performance baselines, and model-version
-parameterization as pending work.
+The runner reads only one source day at a time and automatically adds seven
+label-only timeline days, so every transaction receives its delayed label. A
+run completes only when transaction/label counts match, every decision used the
+pinned model and feature schema, the HTTP outbox is drained when applicable,
+and there are no pending labels, quarantines, or blocked terminals.
+
+For a capacity run, start exactly one scoring worker per Kafka partition in
+separate terminals. Keep their metrics endpoints distinct; use the same pattern
+for the label workers on ports 9301-9303:
+
+```bash
+FRAUDWATCH_SCORING_METRICS_PORT=9201 make run-scoring
+FRAUDWATCH_SCORING_METRICS_PORT=9202 make run-scoring
+FRAUDWATCH_SCORING_METRICS_PORT=9203 make run-scoring
+```
+
+The workers use one native math thread, prepared PostgreSQL statements, and a
+bounded per-partition batch by default. Override the measured defaults with
+`FRAUDWATCH_NATIVE_MATH_THREADS`,
+`FRAUDWATCH_SCORING_BATCH_SIZE_PER_PARTITION`,
+`FRAUDWATCH_LABEL_BATCH_SIZE_PER_PARTITION`, or
+`FRAUDWATCH_DB_PREPARE_THRESHOLD`. More than three workers cannot increase
+parallelism while the topics have three partitions. Do not run host and
+container workers simultaneously when measuring a specific topology.
+
+Run the complete April-through-September dataset without sampling:
+
+```bash
+make benchmark-replay \
+  REPLAY_RUN_ID=phase312-full-v1 \
+  REPLAY_MODE=kafka \
+  REPLAY_ARGS='--days 183 --per-day 0 --timeout 900'
+```
+
+Keep the scoring workers alive after the replay so their latency histograms can
+be collected. Then verify every stored feature vector and score against the
+offline implementation, compute September holdout metrics, and compare the
+same bounded sample from the one-, two-, and three-replica runs:
+
+```bash
+make evaluate-replay \
+  EVALUATION_RUN_ID=phase312-full-v1 \
+  EVALUATION_ARGS='\
+    --scaling-manifest artifacts/replays/phase312-scale-1/manifest.json \
+    --scaling-manifest artifacts/replays/phase312-scale-2/manifest.json \
+    --scaling-manifest artifacts/replays/phase312-scale-3/manifest.json \
+    --metrics-url http://127.0.0.1:9201/metrics \
+    --metrics-url http://127.0.0.1:9202/metrics \
+    --metrics-url http://127.0.0.1:9203/metrics'
+```
+
+The evaluator requires a completed, unsampled 183-day manifest. It reads one
+day at a time, fails on any feature/score/model/schema mismatch, and writes
+machine-readable JSON plus a Markdown summary beside the replay manifest. The
+reports include dataset/model identities, topology, exact counts, workstation
+and database size, throughput, lag-drain time, processing p95, calibration,
+average precision, ROC-AUC, Brier score, precision/recall at 1%, and fraud
+scenario recall.
 
 ## Tests
 

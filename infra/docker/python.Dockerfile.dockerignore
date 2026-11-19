@@ -15,6 +15,7 @@ data
 artifacts
 mlruns
 mlartifacts
+review
 .env
 .env.*
 *.zip

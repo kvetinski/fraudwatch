@@ -7,6 +7,29 @@ import (
 	"testing"
 )
 
+const testDSN = "postgres://user:pass@127.0.0.1:5432/database?sslmode=disable"
+
+func TestDatabasePoolConfig(t *testing.T) {
+	t.Setenv("FRAUDWATCH_DB_MAX_CONNS", "9")
+	t.Setenv("FRAUDWATCH_DB_MIN_CONNS", "3")
+
+	config, err := databasePoolConfig(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.MaxConns != 9 || config.MinConns != 3 {
+		t.Fatalf("unexpected pool size: min=%d max=%d", config.MinConns, config.MaxConns)
+	}
+}
+
+func TestDatabasePoolConfigRejectsInvalidBounds(t *testing.T) {
+	t.Setenv("FRAUDWATCH_DB_MAX_CONNS", "2")
+	t.Setenv("FRAUDWATCH_DB_MIN_CONNS", "3")
+	if _, err := databasePoolConfig(testDSN); err == nil {
+		t.Fatal("expected invalid pool bounds to fail")
+	}
+}
+
 func TestInvalidTransactions(t *testing.T) {
 	cases := map[string]string{
 		"missing ID": `{

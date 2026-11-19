@@ -38,11 +38,8 @@ class PostgresTerminalHistory:
                 count(st.transaction_id) AS tx_count,
                 count(st.transaction_id) FILTER (
                     WHERE
-                        COALESCE(fl.fraud_label, st.fraud_label) = 1
-                        AND COALESCE(
-                            fl.observed_at,
-                            st.label_observed_at
-                        ) <= parameters.feature_at
+                        st.fraud_label = 1
+                        AND st.label_observed_at <= parameters.feature_at
                 ) AS fraud_count
             FROM windows
             CROSS JOIN parameters
@@ -54,8 +51,6 @@ class PostgresTerminalHistory:
                AND st.occurred_at <= parameters.feature_at - make_interval(
                     days => parameters.delay_days
                )
-            LEFT JOIN fraud_labels AS fl
-                ON fl.transaction_id = st.transaction_id
             GROUP BY windows.ordinal
             ORDER BY windows.ordinal
             """,

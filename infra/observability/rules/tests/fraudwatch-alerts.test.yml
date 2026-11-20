@@ -1,196 +1,249 @@
-rule_files:
-  - ../fraudwatch-alerts.yml
-
+rule_files: [../fraudwatch-alerts.yml]
 evaluation_interval: 1m
 
 tests:
-  - name: Scoring worker down is critical after 2 minutes
+  - name: unavailable service becomes critical
     interval: 1m
     input_series:
-      - series: 'up{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
-        values: '0+0x15'
-    alert_rule_test:
-      - eval_time: 1m
-        alertname: FraudWatchScoringWorkerDown
-        exp_alerts: []
-      - eval_time: 3m
-        alertname: FraudWatchScoringWorkerDown
-        exp_alerts:
-          - exp_labels:
-              job: fraudwatch-scoring
-              instance: 127.0.0.1:9101
-              severity: critical
-              service: fraudwatch
-            exp_annotations:
-              summary: "FraudWatch scoring worker exporter is down"
-              description: "Prometheus cannot scrape the scoring worker for at least 2 minutes."
-
-  - name: Labels worker down is warning
-    interval: 1m
-    input_series:
-      - series: 'up{job="fraudwatch-labels",instance="127.0.0.1:9102"}'
-        values: '0+0x15'
+      - series: 'up{job="fraudwatch-ingestion",instance="127.0.0.1:8080"}'
+        values: '0+0x10'
     alert_rule_test:
       - eval_time: 3m
-        alertname: FraudWatchLabelWorkerDown
+        alertname: FraudWatchServiceDown
         exp_alerts:
-          - exp_labels:
-              job: fraudwatch-labels
-              instance: 127.0.0.1:9102
-              severity: warning
-              service: fraudwatch
+          - exp_labels: {job: fraudwatch-ingestion, instance: '127.0.0.1:8080', severity: critical, service: fraudwatch}
             exp_annotations:
-              summary: "FraudWatch label worker exporter is down"
-              description: "Prometheus cannot scrape the label worker for at least 2 minutes."
+              summary: "FraudWatch service exporter is unavailable"
+              description: "Prometheus has been unable to scrape fraudwatch-ingestion for two minutes."
 
-  - name: Persistent high Kafka lag
+  - name: authoritative group lag alerts
     interval: 1m
     input_series:
-      - series: 'fraudwatch_scoring_kafka_lag{partition="0"}'
-        values: '1201+0x15'
+      - series: 'fraudwatch_kafka_consumer_group_lag{group="fraudwatch-scoring-v1",topic="transactions.v1",partition="0"}'
+        values: '1201+0x10'
     alert_rule_test:
-      - eval_time: 2m
-        alertname: FraudWatchScoringKafkaLagHigh
-        exp_alerts: []
-      - eval_time: 7m
-        alertname: FraudWatchScoringKafkaLagHigh
+      - eval_time: 6m
+        alertname: FraudWatchConsumerLagHigh
         exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: fraudwatch
+          - exp_labels: {group: fraudwatch-scoring-v1, topic: transactions.v1, severity: warning, service: fraudwatch}
             exp_annotations:
-              summary: "FraudWatch scoring Kafka backlog exceeds 1000 messages"
-              description: "Total committed-offset backlog has exceeded 1000 messages for 5 minutes."
+              summary: "FraudWatch Kafka consumer lag is high"
+              description: "Consumer group fraudwatch-scoring-v1 has exceeded 1,000 pending records for five minutes."
 
-  - name: Blocked terminals and pending quarantines are actionable
+  - name: consumer backlog without acknowledgments is a stall
     interval: 1m
     input_series:
-      - series: 'fraudwatch_scoring_pending_quarantine{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
-        values: '2+0x20'
-      - series: 'fraudwatch_scoring_blocked_terminals{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
-        values: '1+0x20'
-    alert_rule_test:
-      - eval_time: 12m
-        alertname: FraudWatchPendingQuarantines
-        exp_alerts:
-          - exp_labels:
-              job: fraudwatch-scoring
-              instance: 127.0.0.1:9101
-              severity: warning
-              service: fraudwatch
-            exp_annotations:
-              summary: "FraudWatch has unresolved quarantine records"
-              description: "At least one quarantine record has been pending for 10 minutes. Review with scripts/quarantine.py."
-      - eval_time: 12m
-        alertname: FraudWatchBlockedTerminals
-        exp_alerts:
-          - exp_labels:
-              job: fraudwatch-scoring
-              instance: 127.0.0.1:9101
-              severity: warning
-              service: fraudwatch
-            exp_annotations:
-              summary: "FraudWatch terminal-order blocks need investigation"
-              description: "At least one terminal has remained blocked for 10 minutes; ignoring a quarantine record alone does not unblock it."
-
-  - name: A healthy but stalled scoring consumer with backlog alerts
-    interval: 1m
-    input_series:
-      - series: 'up{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
-        values: '1+0x20'
-      - series: 'fraudwatch_scoring_kafka_lag{partition="0"}'
-        values: '10+0x20'
+      - series: 'fraudwatch_kafka_consumer_group_lag{group="fraudwatch-scoring-v1",topic="transactions.v1",partition="0"}'
+        values: '25+0x15'
       - series: 'fraudwatch_scoring_events_total{outcome="scored"}'
-        values: '100+0x20'
+        values: '0+0x15'
     alert_rule_test:
-      - eval_time: 11m
-        alertname: FraudWatchScoringStalled
+      - eval_time: 10m
+        alertname: FraudWatchConsumerStalled
         exp_alerts:
-          - exp_labels:
-              severity: critical
-              service: fraudwatch
+          - exp_labels: {group: fraudwatch-scoring-v1, severity: critical, service: fraudwatch}
             exp_annotations:
-              summary: "FraudWatch scoring has stalled with a Kafka backlog"
-              description: "Worker is scrapeable, but has made no scoring progress with backlog for at least 3 minutes after a 5-minute observation window."
+              summary: "FraudWatch consumer is stalled with backlog"
+              description: "Consumer group fraudwatch-scoring-v1 has lag but no acknowledged records."
 
-  - name: An idle worker without a Kafka backlog is healthy
+  - name: commit failures are visible immediately
     interval: 1m
     input_series:
-      - series: 'up{job="fraudwatch-scoring",instance="127.0.0.1:9101"}'
-        values: '1+0x20'
-      - series: 'fraudwatch_scoring_kafka_lag{partition="0"}'
-        values: '0+0x20'
+      - series: 'fraudwatch_scoring_kafka_commits_total{result="failure",job="fraudwatch-scoring"}'
+        values: '0+1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FraudWatchKafkaCommitFailure
+        exp_alerts:
+          - exp_labels: {job: fraudwatch-scoring, severity: warning, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch Kafka offset commit failed"
+              description: "fraudwatch-scoring reported at least one synchronous commit failure in five minutes."
+
+  - name: worker error ratio requires meaningful traffic
+    interval: 1m
+    input_series:
       - series: 'fraudwatch_scoring_events_total{outcome="scored"}'
-        values: '100+0x20'
+        values: '0+100x15'
+      - series: 'fraudwatch_scoring_errors_total{category="transient_infrastructure"}'
+        values: '0+10x15'
     alert_rule_test:
-      - eval_time: 12m
-        alertname: FraudWatchScoringStalled
-        exp_alerts: []
-      - eval_time: 12m
-        alertname: FraudWatchScoringKafkaLagHigh
-        exp_alerts: []
+      - eval_time: 10m
+        alertname: FraudWatchWorkerErrorRatioHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch worker error ratio exceeds 5%"
+              description: "The combined scoring/label error ratio is above 5% with meaningful traffic."
 
-  - name: Repeated scoring errors and Kafka commit failures
+  - name: worker error ratio detects failure-only traffic
     interval: 1m
     input_series:
-      - series: 'fraudwatch_scoring_errors_total{category="process"}'
-        values: '0+1x15'
-      - series: 'fraudwatch_scoring_kafka_commits_total{result="failure"}'
-        values: '0+1x15'
+      - series: 'fraudwatch_scoring_errors_total{category="transient_infrastructure"}'
+        values: '0+30x15'
     alert_rule_test:
-      - eval_time: 8m
-        alertname: FraudWatchScoringProcessingErrors
+      - eval_time: 10m
+        alertname: FraudWatchWorkerErrorRatioHigh
         exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: fraudwatch
+          - exp_labels: {severity: warning, service: fraudwatch}
             exp_annotations:
-              summary: "FraudWatch scoring worker reported an error"
-              description: "At least one scoring worker error occurred in the last 5 minutes."
-      - eval_time: 8m
-        alertname: FraudWatchScoringCommitFailures
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: fraudwatch
-            exp_annotations:
-              summary: "FraudWatch encountered a Kafka offset commit failure"
-              description: "At least one scoring offset-commit failure occurred in the last 5 minutes."
+              summary: "FraudWatch worker error ratio exceeds 5%"
+              description: "The combined scoring/label error ratio is above 5% with meaningful traffic."
 
-  - name: Label processing errors
+  - name: ingestion ratio excludes client rejections
     interval: 1m
     input_series:
-      - series: 'fraudwatch_labels_errors_total{category="process"}'
-        values: '0+1x15'
+      - series: 'fraudwatch_ingestion_requests_total{outcome="accepted"}'
+        values: '0+100x15'
+      - series: 'fraudwatch_ingestion_requests_total{outcome="invalid"}'
+        values: '0+50x15'
+      - series: 'fraudwatch_ingestion_requests_total{outcome="unavailable"}'
+        values: '0+10x15'
     alert_rule_test:
-      - eval_time: 8m
-        alertname: FraudWatchLabelProcessingErrors
+      - eval_time: 10m
+        alertname: FraudWatchIngestionErrorRatioHigh
         exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: fraudwatch
+          - exp_labels: {severity: warning, service: fraudwatch}
             exp_annotations:
-              summary: "FraudWatch label worker reported an error"
-              description: "At least one label worker error occurred in the last 5 minutes."
+              summary: "FraudWatch ingestion error ratio exceeds 5%"
+              description: "Durable transaction acceptance failures exceed 5% with meaningful traffic."
 
-  - name: Sustained high p95 scoring latency
+  - name: sustained scoring latency crosses the phase gate
     interval: 1m
     input_series:
-      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="0.02"}'
-        values: '0+0x20'
-      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="0.05"}'
-        values: '0+50x20'
+      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="0.1"}'
+        values: '0+5x15'
+      - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="0.25"}'
+        values: '0+100x15'
       - series: 'fraudwatch_scoring_stage_seconds_bucket{stage="total",le="+Inf"}'
-        values: '0+50x20'
+        values: '0+100x15'
       - series: 'fraudwatch_scoring_stage_seconds_count{stage="total"}'
-        values: '0+50x20'
+        values: '0+100x15'
     alert_rule_test:
-      - eval_time: 12m
+      - eval_time: 10m
         alertname: FraudWatchScoringLatencyHigh
         exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: fraudwatch
+          - exp_labels: {severity: warning, service: fraudwatch}
             exp_annotations:
-              summary: "FraudWatch scoring p95 latency exceeds 20 milliseconds"
-              description: "Estimated p95 worker processing plus Kafka commit latency exceeded 20ms for 5 minutes with more than 100 samples in the 5-minute window."
+              summary: "FraudWatch scoring p95 latency exceeds 100 ms"
+              description: "Acknowledgment latency has exceeded the Phase 3.12 gate for five minutes."
+
+  - name: aged reliability queues alert independently
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_outbox_oldest_pending_age_seconds'
+        values: '120+0x10'
+      - series: 'fraudwatch_quarantine_oldest_pending_age_seconds{event_type="transaction"}'
+        values: '900+0x10'
+      - series: 'fraudwatch_blocked_terminal_oldest_age_seconds'
+        values: '900+0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FraudWatchOutboxBacklogOld
+        exp_alerts:
+          - exp_labels: {severity: critical, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch outbox publication is delayed"
+              description: "The oldest accepted transaction has waited more than one minute for Kafka publication."
+      - eval_time: 6m
+        alertname: FraudWatchPendingQuarantineOld
+        exp_alerts:
+          - exp_labels: {event_type: transaction, severity: warning, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch quarantine needs operator review"
+              description: "A transaction quarantine has remained pending for more than ten minutes."
+      - eval_time: 6m
+        alertname: FraudWatchBlockedTerminalOld
+        exp_alerts:
+          - exp_labels: {severity: warning, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch terminal block needs reconciliation"
+              description: "At least one terminal has remained blocked for more than ten minutes."
+
+  - name: drift alerts are evidence gated
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_model_monitor_alert_eligible'
+        values: '1+0x20'
+      - series: 'fraudwatch_model_score_psi'
+        values: '0.25+0x20'
+      - series: 'fraudwatch_model_feature_psi{feature="log_amount"}'
+        values: '0.10+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: FraudWatchModelDriftWarning
+        exp_alerts:
+          - exp_labels: {severity: warning, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch model population drift exceeds PSI 0.20"
+              description: "Score or feature drift is above the initial warning threshold with sufficient samples and positives."
+
+  - name: missing model snapshot is stale monitoring
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_model_monitor_snapshot_present'
+        values: '0+0x20'
+      - series: 'fraudwatch_model_monitor_snapshot_age_seconds'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: FraudWatchModelMonitoringStale
+        exp_alerts:
+          - exp_labels: {severity: warning, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch model monitoring snapshot is stale"
+              description: "No model-quality evaluation has completed in the last 36 hours."
+
+  - name: critical drift does not duplicate the warning
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_model_monitor_alert_eligible'
+        values: '1+0x20'
+      - series: 'fraudwatch_model_score_psi'
+        values: '0.35+0x20'
+      - series: 'fraudwatch_model_feature_psi{feature="log_amount"}'
+        values: '0.10+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: FraudWatchModelDriftWarning
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: FraudWatchModelDriftCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch model population drift exceeds PSI 0.30"
+              description: "Score or feature drift is above the initial critical threshold with sufficient evidence."
+
+  - name: quality regression alerts with eligible sample
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_model_monitor_alert_eligible'
+        values: '1+0x20'
+      - series: 'fraudwatch_model_quality_degradation_ratio{metric="average_precision"}'
+        values: '0.25+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: FraudWatchModelQualityRegression
+        exp_alerts:
+          - exp_labels: {severity: critical, service: fraudwatch}
+            exp_annotations:
+              summary: "FraudWatch model quality degraded by more than 20%"
+              description: "At least one delayed-label quality metric regressed over 20% from its validation baseline."
+
+  - name: ineligible samples suppress drift and regression
+    interval: 1m
+    input_series:
+      - series: 'fraudwatch_model_monitor_alert_eligible'
+        values: '0+0x20'
+      - series: 'fraudwatch_model_score_psi'
+        values: '0.50+0x20'
+      - series: 'fraudwatch_model_quality_degradation_ratio{metric="average_precision"}'
+        values: '0.50+0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FraudWatchModelDriftWarning
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: FraudWatchModelQualityRegression
+        exp_alerts: []

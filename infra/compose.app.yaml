@@ -25,6 +25,7 @@ services:
       FRAUDWATCH_HTTP_ADDR: 0.0.0.0:8080
       FRAUDWATCH_DB_MAX_CONNS: "20"
       FRAUDWATCH_DB_MIN_CONNS: "2"
+      FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
@@ -57,6 +58,7 @@ services:
       FRAUDWATCH_NATIVE_MATH_THREADS: "1"
       FRAUDWATCH_SCORING_BATCH_SIZE_PER_PARTITION: "8"
       FRAUDWATCH_SCORING_BATCH_WAIT_SECONDS: "0.025"
+      FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
     volumes:
       - type: bind
         source: ../artifacts/candidate-model
@@ -94,6 +96,7 @@ services:
       FRAUDWATCH_DB_PREPARE_THRESHOLD: "1"
       FRAUDWATCH_LABEL_BATCH_SIZE_PER_PARTITION: "64"
       FRAUDWATCH_LABEL_BATCH_WAIT_SECONDS: "0.025"
+      FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
     ports:
       - "127.0.0.1:9102:9102"
     depends_on:
@@ -107,4 +110,21 @@ services:
       timeout: 5s
       retries: 4
       start_period: 30s
+    restart: unless-stopped
+
+  model-monitor-evaluator:
+    image: fraudwatch/python-workers:local
+    command: ["python", "scripts/model_monitor.py", "--database-url", "postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable", "schedule", "--baseline", "/models/candidate/monitoring-baseline.json"]
+    environment:
+      FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
+    volumes:
+      - type: bind
+        source: ../artifacts/candidate-model
+        target: /models/candidate
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped

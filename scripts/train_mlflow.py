@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import date, timedelta
 
 import mlflow
 import mlflow.sklearn
@@ -23,6 +24,9 @@ from fraudwatch_ml.model_serialization import (
     APPROVED_SKOPS_TRUSTED_TYPES,
     SKLEARN_SERIALIZATION_FORMAT,
 )
+from fraudwatch_ml.benchmark_replay import dataset_identity
+from fraudwatch_ml.model_monitoring import build_monitoring_baseline
+from fraudwatch_ml.scoring import FEATURE_SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,6 +157,23 @@ def main():
             },
             "metadata/feature_schema.json",
         )
+
+        source_start = date(2018, 4, 1)
+        source_end = date(2018, 9, 1)
+        source_paths = []
+        source_day = source_start
+        while source_day < source_end:
+            source_paths.append((source_day, DATA_DIR / f"{source_day.isoformat()}.pkl"))
+            source_day += timedelta(days=1)
+        dataset_fingerprint = dataset_identity(source_paths)["sha256"]
+        monitoring_baseline = build_monitoring_baseline(
+            X_val.to_numpy(), scores, y_val,
+            model_reference=f"runs:/{run.info.run_id}/fraud_classifier",
+            model_digest=f"mlflow-run:{run.info.run_id}",
+            dataset_fingerprint=f"sha256:{dataset_fingerprint}",
+            feature_schema_version=FEATURE_SCHEMA_VERSION,
+        )
+        mlflow.log_dict(monitoring_baseline, "metadata/monitoring_baseline.json")
 
         example = X_val.iloc[:5]
 

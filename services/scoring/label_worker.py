@@ -13,6 +13,7 @@ from confluent_kafka import Consumer, KafkaException, TopicPartition
 from fraudwatch_ml.features import LABEL_DELAY_DAYS
 from fraudwatch_ml.labels import parse_label, store_label
 from fraudwatch_ml.observability import LabelMetrics, start_worker_metrics
+from fraudwatch_ml.json_logging import configure_json_logging
 from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
 from fraudwatch_ml.worker_runtime import (
     ShutdownController,
@@ -82,6 +83,18 @@ def process_without_kafka_commit(conn, msg) -> DurableLabelResult:
             kafka_key=msg.key(),
             kafka_payload=msg.value(),
             error=exc,
+        )
+        logger.warning(
+            "Quarantined label topic=%s partition=%s offset=%s reason=%s",
+            msg.topic(), msg.partition(), msg.offset(), exc,
+            extra={
+                "source_topic": msg.topic(),
+                "source_partition": msg.partition(),
+                "source_offset": msg.offset(),
+                "outcome": "quarantined",
+                "reason": exc.reason_code,
+                "duration_ms": (perf_counter() - started) * 1000,
+            },
         )
         quarantined = True
     return DurableLabelResult(
@@ -312,17 +325,18 @@ def process_and_commit(conn, consumer, msg):
 
 
 def main():
+    configure_json_logging("labels")
     if BATCH_SIZE_PER_PARTITION < 1:
         raise ValueError("FRAUDWATCH_LABEL_BATCH_SIZE_PER_PARTITION must be positive")
     if not 0 < BATCH_WAIT_SECONDS <= 1:
         raise ValueError("FRAUDWATCH_LABEL_BATCH_WAIT_SECONDS must be in (0, 1]")
     if DB_PREPARE_THRESHOLD < 0:
         raise ValueError("FRAUDWATCH_DB_PREPARE_THRESHOLD must be nonnegative")
-    metrics = LabelMetrics()
+    metrics = LabelMetrics(topic=KAFKA_TOPIC, group_id=KAFKA_GROUP_ID)
     if os.getenv("FRAUDWATCH_METRICS_ENABLED", "1") == "1":
         port = int(os.getenv("FRAUDWATCH_LABEL_METRICS_PORT", "9102"))
         start_worker_metrics(port, bind=os.getenv("FRAUDWATCH_METRICS_BIND", "127.0.0.1"))
-        print(f"Label /metrics: http://127.0.0.1:{port}/metrics", flush=True)
+        logger.info("Label /metrics: http://127.0.0.1:%s/metrics", port)
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BROKERS,
         "group.id": KAFKA_GROUP_ID,
@@ -331,10 +345,18 @@ def main():
         "enable.auto.offset.store": False,
     })
 
-    consumer.subscribe([KAFKA_TOPIC])
+    consumer.subscribe(
+        [KAFKA_TOPIC],
+        on_assign=lambda _consumer, partitions: metrics.assignment("assigned", partitions),
+        on_revoke=lambda _consumer, partitions: metrics.assignment("revoked", partitions),
+        on_lost=lambda _consumer, partitions: metrics.assignment("lost", partitions),
+    )
     shutdown = ShutdownController()
 
-    print("Fraud-label consumer started", flush=True)
+    logger.info(
+        "Fraud-label consumer started: topic=%s group=%s", KAFKA_TOPIC, KAFKA_GROUP_ID,
+        extra={"source_topic": KAFKA_TOPIC, "consumer_group": KAFKA_GROUP_ID},
+    )
 
     try:
         with install_shutdown_handlers(shutdown):
@@ -353,6 +375,7 @@ def main():
                         ),
                         timeout=BATCH_WAIT_SECONDS,
                     )
+                    metrics.polled()
 
                     # If shutdown arrived during poll, leave this fetched record
                     # unacknowledged for the next group member/restart.
@@ -368,11 +391,14 @@ def main():
                             raise KafkaException(msg.error())
 
                     for partition_messages in partition_batches(messages):
+                        commit_attempted = False
+                        batch_started = perf_counter()
                         try:
                             results = persist_partition_batch(
                                 conn, partition_messages
                             )
                             last = results[-1].message
+                            commit_attempted = True
                             committed = consumer.commit(
                                 offsets=[
                                     TopicPartition(
@@ -394,12 +420,27 @@ def main():
                         except Exception as exc:
                             category = classify_failure(exc)
                             metrics.errors.labels(category=category.value).inc()
+                            if commit_attempted:
+                                metrics.commits.labels(result="failure").inc()
                             logger.exception(
                                 "Label worker failure category=%s; partition "
                                 "batch offset not advanced",
                                 category.value,
+                                extra={
+                                    "source_topic": partition_messages[0].topic(),
+                                    "source_partition": partition_messages[0].partition(),
+                                    "source_offset": partition_messages[0].offset(),
+                                    "last_source_offset": partition_messages[-1].offset(),
+                                    "outcome": "retry_without_ack",
+                                    "reason": category.value,
+                                    "duration_ms": (
+                                        perf_counter() - batch_started
+                                    ) * 1000,
+                                },
                             )
                             raise
+                        metrics.commits.labels(result="success").inc()
+                        metrics.acknowledged(partition_messages)
                         for result in results:
                             metrics.observe_result(
                                 inserted=result.inserted,
@@ -409,12 +450,12 @@ def main():
                             )
 
     except KeyboardInterrupt:
-        print("Stopping label worker")
+        logger.info("Stopping label worker")
     finally:
         if shutdown.requested:
-            print(
-                f"Stopping label worker after signal {shutdown.signal_number}",
-                flush=True,
+            logger.info(
+                "Stopping label worker after signal %s",
+                shutdown.signal_number,
             )
         consumer.close()
 

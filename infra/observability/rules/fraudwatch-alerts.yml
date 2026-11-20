@@ -1,108 +1,174 @@
 groups:
-  - name: fraudwatch-operational
-    interval: 1m
+  - name: fraudwatch-availability
+    interval: 30s
     rules:
-      - alert: FraudWatchScoringWorkerDown
-        expr: up{job="fraudwatch-scoring"} == 0
+      - alert: FraudWatchServiceDown
+        expr: up{job=~"fraudwatch-ingestion|fraudwatch-scoring|fraudwatch-labels|fraudwatch-monitor"} == 0
         for: 2m
-        labels:
-          severity: critical
-          service: fraudwatch
+        labels: {severity: critical, service: fraudwatch}
         annotations:
-          summary: "FraudWatch scoring worker exporter is down"
-          description: "Prometheus cannot scrape the scoring worker for at least 2 minutes."
+          summary: "FraudWatch service exporter is unavailable"
+          description: "Prometheus has been unable to scrape {{ $labels.job }} for two minutes."
 
-      - alert: FraudWatchLabelWorkerDown
-        expr: up{job="fraudwatch-labels"} == 0
+      - alert: FraudWatchMonitorStale
+        expr: absent(fraudwatch_monitor_last_success_unixtime) or (time() - fraudwatch_monitor_last_success_unixtime > 120)
         for: 2m
-        labels:
-          severity: warning
-          service: fraudwatch
+        labels: {severity: critical, service: fraudwatch}
         annotations:
-          summary: "FraudWatch label worker exporter is down"
-          description: "Prometheus cannot scrape the label worker for at least 2 minutes."
+          summary: "FraudWatch independent monitoring is stale"
+          description: "Kafka and PostgreSQL state has not been collected successfully for more than two minutes."
 
-      - alert: FraudWatchScoringKafkaLagHigh
-        expr: sum(fraudwatch_scoring_kafka_lag) > 1000
+  - name: fraudwatch-streaming
+    interval: 30s
+    rules:
+      - alert: FraudWatchConsumerLagHigh
+        expr: sum by (group, topic) (fraudwatch_kafka_consumer_group_lag) > 1000
         for: 5m
-        labels:
-          severity: warning
-          service: fraudwatch
+        labels: {severity: warning, service: fraudwatch}
         annotations:
-          summary: "FraudWatch scoring Kafka backlog exceeds 1000 messages"
-          description: "Total committed-offset backlog has exceeded 1000 messages for 5 minutes."
+          summary: "FraudWatch Kafka consumer lag is high"
+          description: "Consumer group {{ $labels.group }} has exceeded 1,000 pending records for five minutes."
 
-      - alert: FraudWatchScoringStalled
+      - alert: FraudWatchConsumerStalled
         expr: |
-          (sum(fraudwatch_scoring_kafka_lag) > 0)
-          and (sum(rate(fraudwatch_scoring_events_total[5m])) == 0)
-          and (min(up{job="fraudwatch-scoring"}) == 1)
-        for: 3m
-        labels:
-          severity: critical
-          service: fraudwatch
+          sum by (group) (fraudwatch_kafka_consumer_group_lag) > 0
+          and on (group)
+          (
+            label_replace(sum(rate(fraudwatch_scoring_events_total[5m])), "group", "fraudwatch-scoring-v1", "", "") == 0
+            or label_replace(sum(rate(fraudwatch_labels_events_total[5m])), "group", "fraudwatch-labels-v1", "", "") == 0
+          )
+        for: 5m
+        labels: {severity: critical, service: fraudwatch}
         annotations:
-          summary: "FraudWatch scoring has stalled with a Kafka backlog"
-          description: "Worker is scrapeable, but has made no scoring progress with backlog for at least 3 minutes after a 5-minute observation window."
+          summary: "FraudWatch consumer is stalled with backlog"
+          description: "Consumer group {{ $labels.group }} has lag but no acknowledged records."
 
-      - alert: FraudWatchScoringCommitFailures
-        expr: sum(increase(fraudwatch_scoring_kafka_commits_total{result="failure"}[5m])) >= 1
-        for: 0m
-        labels:
-          severity: warning
-          service: fraudwatch
+      - alert: FraudWatchKafkaCommitFailure
+        expr: sum by (job) (increase({__name__=~"fraudwatch_(scoring|labels)_kafka_commits_total",result="failure"}[5m])) > 0
+        labels: {severity: warning, service: fraudwatch}
         annotations:
-          summary: "FraudWatch encountered a Kafka offset commit failure"
-          description: "At least one scoring offset-commit failure occurred in the last 5 minutes."
+          summary: "FraudWatch Kafka offset commit failed"
+          description: "{{ $labels.job }} reported at least one synchronous commit failure in five minutes."
 
-      - alert: FraudWatchScoringProcessingErrors
-        expr: sum(increase(fraudwatch_scoring_errors_total[5m])) >= 1
-        for: 0m
-        labels:
-          severity: warning
-          service: fraudwatch
+      - alert: FraudWatchWorkerErrorRatioHigh
+        expr: |
+          (sum(rate({__name__=~"fraudwatch_(scoring|labels)_errors_total"}[5m])) or vector(0))
+          /
+          clamp_min(
+            (sum(rate({__name__=~"fraudwatch_(scoring|labels)_events_total"}[5m])) or vector(0))
+            + (sum(rate({__name__=~"fraudwatch_(scoring|labels)_errors_total"}[5m])) or vector(0)),
+            0.001
+          )
+          > 0.05
+          and (
+            (sum(increase({__name__=~"fraudwatch_(scoring|labels)_events_total"}[5m])) or vector(0))
+            + (sum(increase({__name__=~"fraudwatch_(scoring|labels)_errors_total"}[5m])) or vector(0))
+          ) > 100
+        for: 5m
+        labels: {severity: warning, service: fraudwatch}
         annotations:
-          summary: "FraudWatch scoring worker reported an error"
-          description: "At least one scoring worker error occurred in the last 5 minutes."
+          summary: "FraudWatch worker error ratio exceeds 5%"
+          description: "The combined scoring/label error ratio is above 5% with meaningful traffic."
 
-      - alert: FraudWatchLabelProcessingErrors
-        expr: sum(increase(fraudwatch_labels_errors_total[5m])) >= 1
-        for: 0m
-        labels:
-          severity: warning
-          service: fraudwatch
+      - alert: FraudWatchIngestionErrorRatioHigh
+        expr: |
+          sum(rate(fraudwatch_ingestion_requests_total{outcome="unavailable"}[5m]))
+          /
+          clamp_min(sum(rate(fraudwatch_ingestion_requests_total[5m])), 0.001)
+          > 0.05
+          and sum(increase(fraudwatch_ingestion_requests_total[5m])) > 100
+        for: 5m
+        labels: {severity: warning, service: fraudwatch}
         annotations:
-          summary: "FraudWatch label worker reported an error"
-          description: "At least one label worker error occurred in the last 5 minutes."
-
-      - alert: FraudWatchPendingQuarantines
-        expr: fraudwatch_scoring_pending_quarantine > 0
-        for: 10m
-        labels:
-          severity: warning
-          service: fraudwatch
-        annotations:
-          summary: "FraudWatch has unresolved quarantine records"
-          description: "At least one quarantine record has been pending for 10 minutes. Review with scripts/quarantine.py."
-
-      - alert: FraudWatchBlockedTerminals
-        expr: fraudwatch_scoring_blocked_terminals > 0
-        for: 10m
-        labels:
-          severity: warning
-          service: fraudwatch
-        annotations:
-          summary: "FraudWatch terminal-order blocks need investigation"
-          description: "At least one terminal has remained blocked for 10 minutes; ignoring a quarantine record alone does not unblock it."
+          summary: "FraudWatch ingestion error ratio exceeds 5%"
+          description: "Durable transaction acceptance failures exceed 5% with meaningful traffic."
 
       - alert: FraudWatchScoringLatencyHigh
         expr: |
-          (histogram_quantile(0.95, sum by (le) (rate(fraudwatch_scoring_stage_seconds_bucket{stage="total"}[5m]))) > 0.020)
-          and (sum(increase(fraudwatch_scoring_stage_seconds_count{stage="total"}[5m])) > 100)
+          histogram_quantile(0.95, sum by (le) (rate(fraudwatch_scoring_stage_seconds_bucket{stage="total"}[5m]))) > 0.100
+          and sum(increase(fraudwatch_scoring_stage_seconds_count{stage="total"}[5m])) > 100
         for: 5m
-        labels:
-          severity: warning
-          service: fraudwatch
+        labels: {severity: warning, service: fraudwatch}
         annotations:
-          summary: "FraudWatch scoring p95 latency exceeds 20 milliseconds"
-          description: "Estimated p95 worker processing plus Kafka commit latency exceeded 20ms for 5 minutes with more than 100 samples in the 5-minute window."
+          summary: "FraudWatch scoring p95 latency exceeds 100 ms"
+          description: "Acknowledgment latency has exceeded the Phase 3.12 gate for five minutes."
+
+      - alert: FraudWatchIngestionLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(fraudwatch_ingestion_request_duration_seconds_bucket[5m]))) > 0.250
+          and sum(increase(fraudwatch_ingestion_request_duration_seconds_count[5m])) > 100
+        for: 5m
+        labels: {severity: warning, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch ingestion p95 latency exceeds 250 ms"
+          description: "HTTP acceptance through the PostgreSQL commit boundary is persistently slow."
+
+  - name: fraudwatch-reliability
+    interval: 30s
+    rules:
+      - alert: FraudWatchOutboxBacklogOld
+        expr: fraudwatch_outbox_oldest_pending_age_seconds > 60
+        for: 5m
+        labels: {severity: critical, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch outbox publication is delayed"
+          description: "The oldest accepted transaction has waited more than one minute for Kafka publication."
+
+      - alert: FraudWatchPendingQuarantineOld
+        expr: fraudwatch_quarantine_oldest_pending_age_seconds > 600
+        for: 5m
+        labels: {severity: warning, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch quarantine needs operator review"
+          description: "A {{ $labels.event_type }} quarantine has remained pending for more than ten minutes."
+
+      - alert: FraudWatchBlockedTerminalOld
+        expr: fraudwatch_blocked_terminal_oldest_age_seconds > 600
+        for: 5m
+        labels: {severity: warning, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch terminal block needs reconciliation"
+          description: "At least one terminal has remained blocked for more than ten minutes."
+
+      - alert: FraudWatchPendingLabelOld
+        expr: fraudwatch_pending_label_oldest_age_seconds > 86400
+        for: 30m
+        labels: {severity: warning, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch pending label is unexpectedly old"
+          description: "A valid delayed label has waited over one day for its transaction."
+
+  - name: fraudwatch-model
+    interval: 1m
+    rules:
+      - alert: FraudWatchModelMonitoringStale
+        expr: absent(fraudwatch_model_monitor_snapshot_present) or fraudwatch_model_monitor_snapshot_present == 0 or fraudwatch_model_monitor_snapshot_age_seconds > 129600
+        for: 15m
+        labels: {severity: warning, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch model monitoring snapshot is stale"
+          description: "No model-quality evaluation has completed in the last 36 hours."
+
+      - alert: FraudWatchModelDriftWarning
+        expr: fraudwatch_model_monitor_alert_eligible == 1 and on() (max(fraudwatch_model_score_psi or fraudwatch_model_feature_psi) > 0.20) and on() (max(fraudwatch_model_score_psi or fraudwatch_model_feature_psi) <= 0.30)
+        for: 15m
+        labels: {severity: warning, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch model population drift exceeds PSI 0.20"
+          description: "Score or feature drift is above the initial warning threshold with sufficient samples and positives."
+
+      - alert: FraudWatchModelDriftCritical
+        expr: fraudwatch_model_monitor_alert_eligible == 1 and on() (max(fraudwatch_model_score_psi or fraudwatch_model_feature_psi) > 0.30)
+        for: 15m
+        labels: {severity: critical, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch model population drift exceeds PSI 0.30"
+          description: "Score or feature drift is above the initial critical threshold with sufficient evidence."
+
+      - alert: FraudWatchModelQualityRegression
+        expr: fraudwatch_model_monitor_alert_eligible == 1 and on() (max(fraudwatch_model_quality_degradation_ratio) > 0.20)
+        for: 15m
+        labels: {severity: critical, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch model quality degraded by more than 20%"
+          description: "At least one delayed-label quality metric regressed over 20% from its validation baseline."

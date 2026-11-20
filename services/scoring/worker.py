@@ -16,7 +16,7 @@ import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter_ns, monotonic
+from time import perf_counter_ns
 from typing import Any
 
 # Keep every scoring replica predictable.  Native BLAS/OpenMP fan-out is
@@ -49,9 +49,8 @@ from fraudwatch_ml.locks import lock_terminal, lock_transaction
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 from fraudwatch_ml.profiling import EventTimings, RollingProfiler
 from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
-from fraudwatch_ml.observability import (
-    ScoringMetrics, start_worker_metrics, refresh_scoring_snapshot,
-)
+from fraudwatch_ml.observability import ScoringMetrics, start_worker_metrics
+from fraudwatch_ml.json_logging import configure_json_logging
 from fraudwatch_ml.terminal_order import (
     TerminalQuarantined, block_for_late_event, quarantine_blocked_terminal,
 )
@@ -88,10 +87,6 @@ BATCH_WAIT_SECONDS = float(
 )
 DB_PREPARE_THRESHOLD = int(os.getenv("FRAUDWATCH_DB_PREPARE_THRESHOLD", "1"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
 logger = logging.getLogger("fraudwatch.scoring")
 
 
@@ -99,6 +94,7 @@ logger = logging.getLogger("fraudwatch.scoring")
 class LoadedScorer:
     model: Any
     model_reference: str
+    model_digest: str = "unknown"
     array_inference: bool = False
 
     def predict_probability(self, values: np.ndarray) -> float:
@@ -150,10 +146,18 @@ def load_scorer() -> LoadedScorer:
             mlflow.sklearn.load_model(str(bundle / "model"))
         )
         model_reference = manifest["model_reference"]
-        logger.info("Loaded portable model: %s", model_reference)
+        logger.info(
+            "Loaded portable model: %s", model_reference,
+            extra={
+                "model_reference": model_reference,
+                "model_digest": manifest.get("model_digest", "unknown"),
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            },
+        )
         return LoadedScorer(
             model=model,
             model_reference=model_reference,
+            model_digest=manifest.get("model_digest", "unknown"),
             array_inference=True,
         )
 
@@ -168,7 +172,14 @@ def load_scorer() -> LoadedScorer:
     model = prepare_model_for_array_inference(
         mlflow.sklearn.load_model(model_reference)
     )
-    logger.info("Loaded model: %s", model_reference)
+    logger.info(
+        "Loaded model: %s", model_reference,
+        extra={
+            "model_reference": model_reference,
+            "model_digest": "unknown",
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        },
+    )
     return LoadedScorer(
         model=model,
         model_reference=model_reference,
@@ -437,6 +448,14 @@ def process_and_commit(conn, scorer, consumer, msg, timings=None, metrics=None):
                 "offset=%s new_record=%s reason=%s",
                 outcome.terminal_id, msg.partition(), msg.offset(),
                 outcome.new_record, outcome.reason,
+                extra={
+                    "source_topic": msg.topic(),
+                    "source_partition": msg.partition(),
+                    "source_offset": msg.offset(),
+                    "outcome": "quarantined",
+                    "reason": outcome.reason,
+                    "duration_ms": (perf_counter_ns() - t0) / 1_000_000,
+                },
             )
             quarantined = True
             new_decision = False
@@ -458,6 +477,14 @@ def process_and_commit(conn, scorer, consumer, msg, timings=None, metrics=None):
             "Quarantined record topic=%s partition=%s offset=%s "
             "new_record=%s reason=%s",
             msg.topic(), msg.partition(), msg.offset(), inserted, exc,
+            extra={
+                "source_topic": msg.topic(),
+                "source_partition": msg.partition(),
+                "source_offset": msg.offset(),
+                "outcome": "quarantined",
+                "reason": exc.reason_code,
+                "duration_ms": (perf_counter_ns() - t0) / 1_000_000,
+            },
         )
         quarantined = True
         new_decision = False
@@ -474,11 +501,11 @@ def process_and_commit(conn, scorer, consumer, msg, timings=None, metrics=None):
             raise RuntimeError(f"Kafka offset commit failed: {errors}")
     except Exception:
         if metrics is not None:
-            metrics.kafka_commits.labels(result="failure").inc()
+            metrics.commits.labels(result="failure").inc()
         raise
     t2 = perf_counter_ns()
     if metrics is not None:
-        metrics.kafka_commits.labels(result="success").inc()
+        metrics.commits.labels(result="success").inc()
 
     return new_decision, quarantined, t1 - t0, t2 - t1
 
@@ -537,6 +564,14 @@ def process_without_kafka_commit(
                 msg.offset(),
                 outcome.new_record,
                 outcome.reason,
+                extra={
+                    "source_topic": msg.topic(),
+                    "source_partition": msg.partition(),
+                    "source_offset": msg.offset(),
+                    "outcome": "quarantined",
+                    "reason": outcome.reason,
+                    "duration_ms": (perf_counter_ns() - started_ns) / 1_000_000,
+                },
             )
             quarantined = True
             new_decision = False
@@ -560,6 +595,14 @@ def process_without_kafka_commit(
             msg.offset(),
             inserted,
             exc,
+            extra={
+                "source_topic": msg.topic(),
+                "source_partition": msg.partition(),
+                "source_offset": msg.offset(),
+                "outcome": "quarantined",
+                "reason": exc.reason_code,
+                "duration_ms": (perf_counter_ns() - started_ns) / 1_000_000,
+            },
         )
         quarantined = True
         new_decision = False
@@ -708,6 +751,7 @@ def log_profile(profiler: RollingProfiler, processed: int, new_decisions: int) -
         )
 
 def main() -> None:
+    configure_json_logging("scoring")
     if STATS_EVERY < 1:
         raise ValueError("STATS_EVERY must be positive")
     if PROFILE_WINDOW < 1:
@@ -721,6 +765,11 @@ def main() -> None:
 
     scorer = load_scorer()
     metrics = ScoringMetrics()
+    metrics.set_model_identity(
+        model_reference=scorer.model_reference,
+        model_digest=scorer.model_digest,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+    )
     if os.getenv("FRAUDWATCH_METRICS_ENABLED", "1") == "1":
         port = int(os.getenv("FRAUDWATCH_SCORING_METRICS_PORT", "9101"))
         start_worker_metrics(port, bind=os.getenv("FRAUDWATCH_METRICS_BIND", "127.0.0.1"))
@@ -734,16 +783,28 @@ def main() -> None:
             "enable.auto.offset.store": False,
         }
     )
-    consumer.subscribe([KAFKA_TOPIC])
+    consumer.subscribe(
+        [KAFKA_TOPIC],
+        on_assign=lambda _consumer, partitions: metrics.assignment("assigned", partitions),
+        on_revoke=lambda _consumer, partitions: metrics.assignment("revoked", partitions),
+        on_lost=lambda _consumer, partitions: metrics.assignment("lost", partitions),
+    )
     shutdown = ShutdownController()
-    logger.info("Scoring consumer started: topic=%s group=%s", KAFKA_TOPIC, KAFKA_GROUP_ID)
+    logger.info(
+        "Scoring consumer started: topic=%s group=%s", KAFKA_TOPIC, KAFKA_GROUP_ID,
+        extra={
+            "source_topic": KAFKA_TOPIC,
+            "consumer_group": KAFKA_GROUP_ID,
+            "model_reference": scorer.model_reference,
+            "model_digest": scorer.model_digest,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        },
+    )
 
     processed = 0
     new_decisions = 0
     quarantined_count = 0
     profiler = RollingProfiler(window=PROFILE_WINDOW)
-    next_snapshot = 0.0
-
     try:
         with install_shutdown_handlers(shutdown):
             with psycopg.connect(
@@ -752,13 +813,6 @@ def main() -> None:
                 prepare_threshold=DB_PREPARE_THRESHOLD,
             ) as conn:
                 while not shutdown.requested:
-                    if monotonic() >= next_snapshot:
-                        try:
-                            refresh_scoring_snapshot(metrics, conn, consumer)
-                        except Exception as exc:
-                            metrics.snapshot_errors.inc()
-                            logger.warning("Monitoring snapshot failed: %s", exc)
-                        next_snapshot = monotonic() + 15.0
                     assigned_partitions = max(1, len(consumer.assignment()))
                     messages = consumer.consume(
                         num_messages=min(
@@ -767,6 +821,7 @@ def main() -> None:
                         ),
                         timeout=BATCH_WAIT_SECONDS,
                     )
+                    metrics.polled()
                     # Do not begin another database transaction after shutdown.
                     # Records fetched by this consume remain unacknowledged.
                     if shutdown.requested:
@@ -781,6 +836,7 @@ def main() -> None:
                     for partition_messages in partition_batches(messages):
                         results: list[DurableMessageResult] = []
                         commit_attempted = False
+                        batch_started_ns = perf_counter_ns()
                         try:
                             results = persist_scoring_partition_batch(
                                 conn,
@@ -795,14 +851,26 @@ def main() -> None:
                             category = classify_failure(exc)
                             metrics.errors.labels(category=category.value).inc()
                             if commit_attempted:
-                                metrics.kafka_commits.labels(result="failure").inc()
+                                metrics.commits.labels(result="failure").inc()
                             logger.exception(
                                 "Scoring failure category=%s; partition batch "
                                 "offset not advanced",
                                 category.value,
+                                extra={
+                                    "source_topic": partition_messages[0].topic(),
+                                    "source_partition": partition_messages[0].partition(),
+                                    "source_offset": partition_messages[0].offset(),
+                                    "last_source_offset": partition_messages[-1].offset(),
+                                    "outcome": "retry_without_ack",
+                                    "reason": category.value,
+                                    "duration_ms": (
+                                        perf_counter_ns() - batch_started_ns
+                                    ) / 1_000_000,
+                                },
                             )
                             raise
-                        metrics.kafka_commits.labels(result="success").inc()
+                        metrics.commits.labels(result="success").inc()
+                        metrics.acknowledged(partition_messages)
 
                         for result in results:
                             processing_ns = result.durable_ns - result.started_ns

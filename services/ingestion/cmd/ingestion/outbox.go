@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -99,17 +99,29 @@ func runPublisher(
 	ctx context.Context,
 	db *pgxpool.Pool,
 	kafka *kgo.Client,
+	metrics *ingestionMetrics,
 ) {
 	for ctx.Err() == nil {
 		batchCtx, cancel := context.WithTimeout(
 			ctx, 10*time.Second,
 		)
 
+		started := time.Now()
 		count, err := publishBatch(batchCtx, db, kafka)
 		cancel()
+		elapsed := time.Since(started)
+		if ctx.Err() != nil {
+			return
+		}
 
-		if err != nil && ctx.Err() == nil {
-			log.Printf("outbox publisher: %v", err)
+		if err != nil {
+			metrics.observeOutbox("failure", 0, elapsed)
+			slog.Error("outbox publication failed", "error", err, "outcome", "retry", "duration_ms", elapsed.Milliseconds())
+		} else if count > 0 {
+			metrics.observeOutbox("success", count, elapsed)
+			slog.Info("outbox batch published", "count", count, "outcome", "published", "duration_ms", elapsed.Milliseconds())
+		} else {
+			metrics.observeOutbox("empty", 0, elapsed)
 		}
 
 		if count == outboxBatchSize {

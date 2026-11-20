@@ -1,7 +1,29 @@
 # Linux-only local development overlay: host networking lets Prometheus scrape
 # loopback-only /metrics endpoints on Python workers running on the host.
-# Start with: docker compose -f infra/compose.yaml -f infra/compose.observability.yaml up -d prometheus grafana
+# Start with: make obs-up
 services:
+  monitor:
+    image: fraudwatch/python-workers:local
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+      network: host
+    network_mode: host
+    command: ["python", "services/monitor/monitor.py"]
+    environment:
+      DATABASE_URL: "postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch?sslmode=disable&options=-cdefault_transaction_read_only%3Don"
+      KAFKA_BROKERS: 127.0.0.1:9092
+      FRAUDWATCH_METRICS_BIND: 127.0.0.1
+      FRAUDWATCH_MONITOR_METRICS_PORT: "9103"
+      FRAUDWATCH_MONITOR_INTERVAL_SECONDS: "15"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9103/metrics', timeout=2).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v3.5.0
     network_mode: host
@@ -10,10 +32,61 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=7d
       - --web.listen-address=127.0.0.1:9090
+      - --web.enable-lifecycle
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    network_mode: host
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=127.0.0.1:9093
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    restart: unless-stopped
+
+  loki-init:
+    image: alpine:3.22
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        mkdir -p /loki/chunks /loki/rules /loki/compactor &&
+        chown 10001:10001 /loki /loki/chunks /loki/rules /loki/compactor &&
+        chmod 0750 /loki /loki/chunks /loki/rules /loki/compactor
+    volumes:
+      - loki-data:/loki
+    restart: "no"
+
+  loki:
+    image: grafana/loki:3.7.0
+    network_mode: host
+    depends_on:
+      loki-init:
+        condition: service_completed_successfully
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - ./observability/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.11.3
+    network_mode: host
+    command: ["run", "--server.http.listen-addr=127.0.0.1:12345", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    depends_on:
+      - loki
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
     restart: unless-stopped
 
   grafana:
@@ -21,6 +94,7 @@ services:
     network_mode: host
     depends_on:
       - prometheus
+      - loki
     environment:
       GF_SERVER_HTTP_ADDR: 127.0.0.1
       GF_SERVER_HTTP_PORT: "3000"
@@ -37,3 +111,6 @@ services:
 volumes:
   prometheus-data:
   grafana-data:
+  alertmanager-data:
+  loki-data:
+  alloy-data:

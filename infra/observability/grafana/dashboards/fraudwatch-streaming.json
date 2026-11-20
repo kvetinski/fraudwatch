@@ -1,0 +1,13 @@
+{
+  "uid": "fraudwatch-streaming", "title": "FraudWatch — Streaming", "tags": ["fraudwatch", "kafka"],
+  "timezone": "browser", "schemaVersion": 41, "version": 1, "refresh": "5s", "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {"id": 1, "title": "Authoritative consumer-group lag", "type": "timeseries", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 9}, "targets": [{"refId": "A", "expr": "fraudwatch_kafka_consumer_group_lag", "legendFormat": "{{group}} p{{partition}}"}], "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}},
+    {"id": 2, "title": "Total lag by group", "type": "stat", "gridPos": {"x": 0, "y": 9, "w": 8, "h": 6}, "targets": [{"refId": "A", "expr": "sum by (group) (fraudwatch_kafka_consumer_group_lag)", "legendFormat": "{{group}}"}]},
+    {"id": 3, "title": "Assigned partitions per replica", "type": "timeseries", "gridPos": {"x": 8, "y": 9, "w": 8, "h": 6}, "targets": [{"refId": "A", "expr": "fraudwatch_scoring_kafka_assigned_partitions", "legendFormat": "scoring {{instance}}"}, {"refId": "B", "expr": "fraudwatch_labels_kafka_assigned_partitions", "legendFormat": "labels {{instance}}"}]},
+    {"id": 4, "title": "Rebalances / hour", "type": "timeseries", "gridPos": {"x": 16, "y": 9, "w": 8, "h": 6}, "targets": [{"refId": "A", "expr": "sum by (job, event) (increase({__name__=~\"fraudwatch_(scoring|labels)_kafka_rebalances_total\"}[1h]))", "legendFormat": "{{job}} {{event}}"}]},
+    {"id": 5, "title": "Kafka queue age p95", "type": "timeseries", "gridPos": {"x": 0, "y": 15, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (job, le) (rate({__name__=~\"fraudwatch_(scoring|labels)_queue_age_seconds_bucket\"}[5m])))", "legendFormat": "{{job}}"}], "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
+    {"id": 6, "title": "Seconds since last acknowledgment", "type": "timeseries", "gridPos": {"x": 12, "y": 15, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "time() - fraudwatch_scoring_last_ack_unixtime", "legendFormat": "scoring {{instance}}"}, {"refId": "B", "expr": "time() - fraudwatch_labels_last_ack_unixtime", "legendFormat": "labels {{instance}}"}], "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
+    {"id": 7, "title": "Offset commit failures", "type": "timeseries", "gridPos": {"x": 0, "y": 23, "w": 24, "h": 7}, "targets": [{"refId": "A", "expr": "sum by (job) (increase({__name__=~\"fraudwatch_(scoring|labels)_kafka_commits_total\",result=\"failure\"}[5m]))", "legendFormat": "{{job}}"}]}
+  ]
+}

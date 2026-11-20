@@ -1,0 +1,14 @@
+{
+  "uid": "fraudwatch-reliability", "title": "FraudWatch — Reliability", "tags": ["fraudwatch", "reliability"],
+  "timezone": "browser", "schemaVersion": 41, "version": 1, "refresh": "5s", "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {"id": 1, "title": "Pending outbox events", "type": "stat", "gridPos": {"x": 0, "y": 0, "w": 6, "h": 6}, "targets": [{"refId": "A", "expr": "fraudwatch_outbox_pending_events"}]},
+    {"id": 2, "title": "Oldest outbox event", "type": "stat", "gridPos": {"x": 6, "y": 0, "w": 6, "h": 6}, "targets": [{"refId": "A", "expr": "fraudwatch_outbox_oldest_pending_age_seconds"}], "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
+    {"id": 3, "title": "Pending quarantines", "type": "stat", "gridPos": {"x": 12, "y": 0, "w": 6, "h": 6}, "targets": [{"refId": "A", "expr": "fraudwatch_quarantine_pending_events", "legendFormat": "{{event_type}}"}]},
+    {"id": 4, "title": "Oldest quarantine", "type": "stat", "gridPos": {"x": 18, "y": 0, "w": 6, "h": 6}, "targets": [{"refId": "A", "expr": "fraudwatch_quarantine_oldest_pending_age_seconds", "legendFormat": "{{event_type}}"}], "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}},
+    {"id": 5, "title": "Blocked terminals", "type": "timeseries", "gridPos": {"x": 0, "y": 6, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "fraudwatch_blocked_terminals", "legendFormat": "count"}, {"refId": "B", "expr": "fraudwatch_blocked_terminal_oldest_age_seconds", "legendFormat": "oldest age (s)"}]},
+    {"id": 6, "title": "Pending delayed labels", "type": "timeseries", "gridPos": {"x": 12, "y": 6, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "fraudwatch_pending_labels", "legendFormat": "count"}, {"refId": "B", "expr": "fraudwatch_pending_label_oldest_age_seconds", "legendFormat": "oldest age (s)"}]},
+    {"id": 7, "title": "Outbox publication attempts", "type": "timeseries", "gridPos": {"x": 0, "y": 14, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "sum by (result) (rate(fraudwatch_ingestion_outbox_publish_attempts_total[5m]))", "legendFormat": "{{result}}"}]},
+    {"id": 8, "title": "Independent monitor freshness", "type": "timeseries", "gridPos": {"x": 12, "y": 14, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "time() - fraudwatch_monitor_last_success_unixtime", "legendFormat": "seconds since success"}], "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}}
+  ]
+}

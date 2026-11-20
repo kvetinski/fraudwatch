@@ -2,21 +2,21 @@
 
 FraudWatch is a local-development fraud-detection pipeline built around a Go
 ingestion API, Kafka, PostgreSQL, Python scoring and label consumers, MLflow,
-Prometheus, and Grafana. It accepts transactions through a durable
+Prometheus, Grafana, Alertmanager, Loki, and Alloy. It accepts transactions through a durable
 transactional outbox, scores them from the stream, stores decisions and
 terminal history, and exposes operational metrics and alerts.
 
 The repository currently targets a single-machine Linux environment. It has
 useful reliability controls and container definitions, but it is not yet a
-production deployment: CI/CD, Kubernetes manifests, authentication, TLS,
-secret management, and automated model-drift monitoring are still to be added.
+production deployment: CI/CD, Kubernetes manifests, authentication, TLS, and
+secret management are still to be added.
 
 ## Architecture
 
 ```text
                                       +---------------------------+
-                                      | Prometheus -> Grafana     |
-                                      | metrics + local alerts    |
+                                      | monitor -> Prometheus     |
+                                      | dashboards/alerts/logs    |
                                       +-------------^-------------+
                                                     |
 client -> Go ingestion API -> PostgreSQL outbox -> Kafka transactions.v1
@@ -37,6 +37,9 @@ historical replay -----------------------------> Kafka fraud-labels.v1
                                                          v
                                                     PostgreSQL
 ```
+
+All containerized services emit structured JSON logs through Alloy to Loki;
+Grafana queries both Prometheus metrics and Loki logs.
 
 The main processing path is:
 
@@ -123,8 +126,9 @@ make test
 
 `make setup` creates `.venv`, installs the project, downloads the local dataset,
 starts Kafka and PostgreSQL, applies migrations, creates both Kafka topics, and
-bootstraps an MLflow candidate model. `make obs-install` explicitly installs
-the Prometheus Python client used by both workers.
+bootstraps an MLflow candidate model. `make obs-install` remains available as a
+small standalone metrics-client installation target; `make install` already
+includes it through the streaming dependencies.
 
 Run the host processes in separate terminals:
 
@@ -138,11 +142,17 @@ Useful endpoints:
 
 | Component | Local endpoint |
 |---|---|
-| Ingestion health | `http://127.0.0.1:8080/healthz` |
+| Ingestion liveness | `http://127.0.0.1:8080/livez` |
+| Ingestion readiness | `http://127.0.0.1:8080/readyz` |
+| Ingestion metrics | `http://127.0.0.1:8080/metrics` |
 | Scoring metrics | `http://127.0.0.1:9101/metrics` |
 | Label metrics | `http://127.0.0.1:9102/metrics` |
+| Independent monitor | `http://127.0.0.1:9103/metrics` |
 | MLflow UI (`make mlflow-ui`) | `http://127.0.0.1:5001` |
 | Prometheus | `http://127.0.0.1:9090` |
+| Alertmanager | `http://127.0.0.1:9093` |
+| Loki | `http://127.0.0.1:3100/ready` |
+| Alloy | `http://127.0.0.1:12345` |
 | Grafana | `http://127.0.0.1:3000` |
 
 Run `make help` to see all supported commands. `make down` removes only the
@@ -252,15 +262,27 @@ make obs-up
 make obs-check
 ```
 
-Grafana provisions a Prometheus data source and the **FraudWatch — Streaming
-Operations** dashboard automatically. The current metrics cover:
+Grafana provisions Prometheus and Loki data sources plus four dashboards:
+**Services**, **Streaming**, **Reliability**, and **Model Quality**. Telemetry
+covers ingress and outbox behavior, acknowledged worker outcomes and latency,
+independent committed lag for both consumer groups, durable reliability state,
+and delayed-label drift/quality metrics.
 
-- scoring and label throughput;
-- scoring stage latency histograms;
-- committed scoring-consumer lag by partition;
-- worker processing and Kafka-commit errors;
-- pending quarantine and blocked-terminal counts; and
-- committed model-score distributions.
+For a candidate exported before monitoring baselines were introduced, create
+its reference bins once, then evaluate a window:
+
+```bash
+make model-monitor-baseline
+make model-monitor-evaluate \
+  MODEL_MONITOR_ARGS='--start 2026-11-17T00:00:00Z --end 2026-11-18T00:00:00Z'
+```
+
+New training runs log reference bins, validation metrics, dataset fingerprint,
+schema version, and model identity to MLflow. New portable exports include the
+baseline automatically. The containerized evaluator idempotently persists the
+last complete delayed-label day every hour. Drift and quality alerts stay
+gated until a window contains at least 1,000 samples and 20 positive labels;
+the model dashboard separately exposes labeled count and label coverage.
 
 Validate and load the Prometheus rules with:
 
@@ -271,15 +293,26 @@ make alerts-up
 make alerts-status
 ```
 
-The rules cover worker availability, scoring lag and stalls, commit and
-processing failures, pending quarantine, blocked terminals, and high scoring
-latency. Their thresholds are local-development defaults, and Prometheus rule
-evaluation does not send notifications because Alertmanager is not configured.
+The configuration and rule checks run in disposable, network-disabled
+containers with read-only bind mounts. They do not start the stack or create
+its application data volumes.
 
-Prometheus and Grafana bind to loopback using Linux host networking. The
+The rules cover service availability, stale monitoring, lag/stalls, commit and
+error ratios, ingress/scoring latency, old durable backlog state, stale model
+evaluation, drift, and quality regression. Alertmanager is connected but has
+no external receiver credentials; alerts remain visible locally until an
+approved notification destination is configured.
+
+Prometheus, Alertmanager, Loki, Alloy, and Grafana bind to loopback using Linux
+host networking. Alloy has read-only Docker-socket access to discover and tail
+Compose logs; treat that socket access as privileged. The
+one-shot `loki-init` service prepares the persistent storage directory for
+Loki's non-root runtime user; its successful exited status is expected. The
 default Grafana login is `admin` / `fraudwatch_local_only`; set
 `FRAUDWATCH_GRAFANA_PASSWORD` before the first `make obs-up` for any persistent
-local environment. Do not expose these services publicly.
+local environment. Do not expose these services publicly. The metric contract
+and incident triage order are documented in
+[`docs/observability.md`](docs/observability.md).
 
 ## Quarantine operations
 
@@ -500,11 +533,12 @@ fraudwatch_ml/                  shared feature, scoring, label, and reliability 
 contracts/                      versioned JSON Schemas and shared contract fixtures
 services/ingestion/             Go API and transactional outbox publisher
 services/scoring/               Python scoring and delayed-label consumers
+services/monitor/               independent read-only Kafka/PostgreSQL exporter
 infra/compose.yaml              Kafka and PostgreSQL
 infra/compose.app.yaml          local application-container overlay
-infra/compose.observability.yaml Prometheus and Grafana overlay
+infra/compose.observability.yaml local metrics, alerting, dashboards, and logs
 infra/migrations/               ordered PostgreSQL schema files
-infra/observability/            scrape config, dashboard, rules, and rule tests
+infra/observability/            Prometheus/Grafana/Alertmanager/Loki/Alloy config
 scripts/                        setup, training, replay, verification, and operations
 tests/                          Python unit and PostgreSQL integration tests
 ```
@@ -518,17 +552,15 @@ The baseline is intentionally explicit about its remaining gaps:
 
 - Terminal-order reconciliation is intentionally operator-driven and currently
   replays one terminal at a time in memory; bulk recovery scheduling is absent.
-- Consumer concurrency, sustained throughput, backpressure, crash recovery, and
-  full-dataset replay have not been benchmarked systematically.
-- Monitoring does not yet cover Go ingress, label-consumer lag, Kafka/PostgreSQL
-  internals, end-to-end latency, true model drift, or notification delivery.
-- Python dependencies have ranges but no resolved lock file, and the Prometheus
-  client is installed separately instead of being declared in the package
-  streaming extras.
+- Python dependencies have ranges but no resolved lock file, and observability
+  image pins are maintained manually rather than by a dependency updater.
 - SQL migrations are replayable files but have no migration ledger or checksum
   enforcement.
 - There is no CI pipeline, image publication workflow, or local Kubernetes
-  deployment yet.
+  deployment yet. Kubernetes ServiceMonitors, kube-state-metrics, and
+  crash-loop alerts belong to Phase 4.2.
+- Alertmanager has no external notification destination in the checked-in
+  local configuration, and distributed tracing is intentionally deferred.
 - Local credentials are development defaults; the services have no TLS,
   authentication, authorization, or external secret management.
 

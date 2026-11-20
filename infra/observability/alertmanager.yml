@@ -1,0 +1,11 @@
+route:
+  receiver: local-dashboard-only
+  group_by: [alertname, severity]
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  # Local development intentionally has no external notification credentials.
+  # Active alerts remain inspectable in Alertmanager and Grafana.
+  - name: local-dashboard-only

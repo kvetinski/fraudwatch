@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -54,7 +56,8 @@ type transactionEnvelope struct {
 }
 
 type Server struct {
-	db *pgxpool.Pool
+	db      *pgxpool.Pool
+	metrics *ingestionMetrics
 }
 
 func validate(tx *Transaction) error {
@@ -212,12 +215,20 @@ func acceptTransaction(
 }
 
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" || len(requestID) > 128 {
+		requestID = newRequestID()
+	}
+	w.Header().Set("X-Request-ID", requestID)
 	w.Header().Set("Content-Type", "application/json")
 	r.Body = http.MaxBytesReader(w, r.Body, maxEventBytes)
 	defer r.Body.Close()
 
 	event, err := decodeTransaction(r.Body)
 	if err != nil {
+		s.observeRequest("invalid", time.Since(started))
+		slog.Warn("transaction rejected", "request_id", requestID, "outcome", "invalid", "reason", err.Error(), "duration_ms", time.Since(started).Milliseconds())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -227,16 +238,25 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 
 	duplicate, err := acceptTransaction(ctx, s.db, event)
 	if errors.Is(err, ErrConflict) {
+		s.observeRequest("conflict", time.Since(started))
+		slog.Warn("transaction rejected", "request_id", requestID, "correlation_id", event.TransactionID, "outcome", "conflict", "reason", "transaction_id_reused", "duration_ms", time.Since(started).Milliseconds())
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 	if err != nil {
-		log.Printf("transaction acceptance failed: %v", err)
+		s.observeRequest("unavailable", time.Since(started))
+		slog.Error("transaction acceptance failed", "request_id", requestID, "correlation_id", event.TransactionID, "outcome", "unavailable", "duration_ms", time.Since(started).Milliseconds(), "error", err)
 		http.Error(w, "transaction acceptance unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+	outcome := "accepted"
+	if duplicate {
+		outcome = "duplicate"
+	}
+	s.observeRequest(outcome, time.Since(started))
+	slog.Info("transaction accepted", "request_id", requestID, "correlation_id", event.TransactionID, "outcome", outcome, "duration_ms", time.Since(started).Milliseconds())
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"transaction_id": event.TransactionID,
 		"status":         "accepted",
@@ -244,7 +264,26 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) observeRequest(outcome string, elapsed time.Duration) {
+	if s.metrics != nil {
+		s.metrics.observeRequest(outcome, elapsed)
+	}
+}
+
+func newRequestID() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return fmt.Sprintf("local-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(value)
+}
+
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(
+		"service", "ingestion",
+		"build_revision", envOrDefault("FRAUDWATCH_BUILD_REVISION", "development"),
+	)
+	slog.SetDefault(logger)
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "postgres://fraudwatch:fraudwatch_dev@" +
@@ -253,11 +292,13 @@ func main() {
 
 	poolConfig, err := databasePoolConfig(dsn)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("invalid PostgreSQL pool configuration", "error", err)
+		os.Exit(1)
 	}
 	db, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("PostgreSQL pool creation failed", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -267,7 +308,8 @@ func main() {
 	err = db.Ping(pingCtx)
 	cancel()
 	if err != nil {
-		log.Fatalf("PostgreSQL unavailable: %v", err)
+		slog.Error("PostgreSQL unavailable", "error", err)
+		os.Exit(1)
 	}
 
 	brokers := os.Getenv("KAFKA_BROKERS")
@@ -280,7 +322,8 @@ func main() {
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 	)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Kafka client creation failed", "error", err)
+		os.Exit(1)
 	}
 	defer kafka.Close()
 
@@ -291,20 +334,34 @@ func main() {
 	)
 	defer stop()
 
+	metrics := newIngestionMetrics(envOrDefault("FRAUDWATCH_BUILD_REVISION", "development"))
 	// Publication failures do not prevent HTTP acceptance.
 	publisherDone := make(chan struct{})
 	go func() {
 		defer close(publisherDone)
-		runPublisher(ctx, db, kafka)
+		runPublisher(ctx, db, kafka, metrics)
 	}()
 
-	server := &Server{db: db}
+	server := &Server{db: db, metrics: metrics}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/transactions", server.ingest)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /metrics", metrics.handler(db))
+	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	readiness := func(w http.ResponseWriter, r *http.Request) {
+		checkCtx, checkCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer checkCancel()
+		if err := db.Ping(checkCtx); err != nil {
+			http.Error(w, "postgres unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	}
+	mux.HandleFunc("GET /readyz", readiness)
+	mux.HandleFunc("GET /healthz", readiness)
 
 	httpServer := &http.Server{
 		Addr:              fraudwatchHTTPAddr(),
@@ -315,10 +372,10 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Ingestion API listening on %s", fraudwatchHTTPAddr())
+		slog.Info("ingestion API listening", "address", fraudwatchHTTPAddr())
 		if err := httpServer.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
-			log.Printf("HTTP server failure: %v", err)
+			slog.Error("HTTP server failure", "error", err)
 			stop()
 		}
 	}()
@@ -335,6 +392,13 @@ func main() {
 	}
 
 	<-publisherDone
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 // fraudwatchHTTPAddr preserves the loopback-only development default and lets

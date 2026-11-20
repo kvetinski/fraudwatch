@@ -15,18 +15,19 @@ app-build: ## Build Go API and Python worker images using host build networking
 
 app-up: ## Build via host networking and start the containerized API and workers
 	@test -f artifacts/candidate-model/model/MLmodel || { echo 'Run make app-export-model first' >&2; exit 1; }
-	@$(APP_COMPOSE) up -d --build ingestion scoring labels
+	@$(APP_COMPOSE) up -d --build ingestion scoring labels model-monitor-evaluator
 
 app-stop: ## Stop ONLY app containers; preserve Kafka/PostgreSQL and monitoring
-	@$(APP_COMPOSE) stop ingestion scoring labels
+	@$(APP_COMPOSE) stop ingestion scoring labels model-monitor-evaluator
 
-app-status: ## Inspect the three app containers
-	@$(APP_COMPOSE) ps ingestion scoring labels
+app-status: ## Inspect API, worker, and model-evaluator containers
+	@$(APP_COMPOSE) ps ingestion scoring labels model-monitor-evaluator
 
-app-logs: ## Follow logs from Go API and both Python workers
-	@$(APP_COMPOSE) logs -f --tail=80 ingestion scoring labels
+app-logs: ## Follow logs from API, workers, and model evaluator
+	@$(APP_COMPOSE) logs -f --tail=80 ingestion scoring labels model-monitor-evaluator
 
 app-check: ## Check application HTTP and metrics endpoints
 	@curl -fsS http://127.0.0.1:8080/healthz >/dev/null && echo 'Ingestion API: OK'
+	@curl -fsS http://127.0.0.1:8080/metrics >/dev/null && echo 'Ingestion metrics: OK'
 	@curl -fsS http://127.0.0.1:9101/metrics >/dev/null && echo 'Scoring metrics: OK'
 	@curl -fsS http://127.0.0.1:9102/metrics >/dev/null && echo 'Label metrics: OK'

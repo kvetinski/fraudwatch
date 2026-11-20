@@ -23,18 +23,20 @@ def test_scoring_metrics_expose_counters_histogram_and_gauges():
         new_decision=False, quarantined=False, timings=FakeTimings(),
         processing_ns=100_000, commit_ns=20_000,
     )
-    metrics.pending_quarantine.set(2)
-    metrics.blocked_terminals.set(1)
-    metrics.kafka_lag.labels(partition="1").set(3)
+    metrics.commits.labels(result="success").inc()
+    metrics.assignment("assigned", [object(), object()])
+    metrics.polled()
     data = generate_latest(registry).decode()
     assert 'fraudwatch_scoring_events_total{outcome="scored"} 1.0' in data
     assert 'fraudwatch_scoring_events_total{outcome="quarantined"} 1.0' in data
     assert 'fraudwatch_scoring_events_total{outcome="duplicate"} 1.0' in data
     assert 'fraudwatch_scoring_stage_seconds_count{stage="inference"} 1.0' in data
-    assert 'fraudwatch_scoring_stage_seconds_count{stage="total"} 1.0' in data
-    assert 'fraudwatch_scoring_pending_quarantine 2.0' in data
-    assert 'fraudwatch_scoring_blocked_terminals 1.0' in data
-    assert 'fraudwatch_scoring_kafka_lag{partition="1"} 3.0' in data
+    assert 'fraudwatch_scoring_stage_seconds_count{stage="total"} 3.0' in data
+    assert 'fraudwatch_scoring_kafka_commits_total{result="success"} 1.0' in data
+    assert 'fraudwatch_scoring_errors_total{category="transient_infrastructure"} 0.0' in data
+    assert 'fraudwatch_scoring_errors_total{category="fatal_processing"} 0.0' in data
+    assert "fraudwatch_scoring_kafka_assigned_partitions 2.0" in data
+    assert "fraudwatch_scoring_last_poll_unixtime" in data
 
 
 def test_label_metrics_only_acknowledged_events():
@@ -53,31 +55,16 @@ def test_label_metrics_only_acknowledged_events():
     assert 'fraudwatch_labels_stage_seconds_count{stage="total"} 3.0' in data
 
 
-def test_snapshot_lag_uses_committed_offset_not_fetched_position():
-    from types import SimpleNamespace
-    from fraudwatch_ml.observability import refresh_scoring_snapshot
-
-    class Connection:
-        def execute(self, query):
-            return self
-
-        def fetchone(self):
-            return (4, 2)
-
-    class Consumer:
-        def assignment(self):
-            return [SimpleNamespace(topic="transactions.v1", partition=1)]
-
-        def committed(self, parts, timeout):
-            return [SimpleNamespace(offset=42, error=None)]
-
-        def get_watermark_offsets(self, part, timeout, cached):
-            return (0, 50)
-
+def test_total_latency_covers_duplicate_and_quarantine_outcomes():
     registry = CollectorRegistry()
     metrics = ScoringMetrics(registry=registry)
-    refresh_scoring_snapshot(metrics, Connection(), Consumer())
+    metrics.observe_result(
+        new_decision=False, quarantined=False, timings=FakeTimings(),
+        processing_ns=100_000, commit_ns=20_000,
+    )
+    metrics.observe_result(
+        new_decision=False, quarantined=True, timings=FakeTimings(),
+        processing_ns=100_000, commit_ns=20_000,
+    )
     data = generate_latest(registry).decode()
-    assert 'fraudwatch_scoring_pending_quarantine 4.0' in data
-    assert 'fraudwatch_scoring_blocked_terminals 2.0' in data
-    assert 'fraudwatch_scoring_kafka_lag{partition="1"} 8.0' in data
+    assert 'fraudwatch_scoring_stage_seconds_count{stage="total"} 2.0' in data

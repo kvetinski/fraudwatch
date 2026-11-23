@@ -12,7 +12,7 @@ from confluent_kafka import Consumer, KafkaException, TopicPartition
 
 from fraudwatch_ml.features import LABEL_DELAY_DAYS
 from fraudwatch_ml.labels import parse_label, store_label
-from fraudwatch_ml.observability import LabelMetrics, start_worker_metrics
+from fraudwatch_ml.observability import LabelMetrics, WorkerHealth, start_worker_metrics
 from fraudwatch_ml.json_logging import configure_json_logging
 from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
 from fraudwatch_ml.worker_runtime import (
@@ -333,10 +333,22 @@ def main():
     if DB_PREPARE_THRESHOLD < 0:
         raise ValueError("FRAUDWATCH_DB_PREPARE_THRESHOLD must be nonnegative")
     metrics = LabelMetrics(topic=KAFKA_TOPIC, group_id=KAFKA_GROUP_ID)
+    health = WorkerHealth(
+        ("database", "kafka"),
+        heartbeat_timeout=float(
+            os.getenv("FRAUDWATCH_WORKER_HEARTBEAT_TIMEOUT_SECONDS", "15")
+        ),
+    )
     if os.getenv("FRAUDWATCH_METRICS_ENABLED", "1") == "1":
         port = int(os.getenv("FRAUDWATCH_LABEL_METRICS_PORT", "9102"))
-        start_worker_metrics(port, bind=os.getenv("FRAUDWATCH_METRICS_BIND", "127.0.0.1"))
-        logger.info("Label /metrics: http://127.0.0.1:%s/metrics", port)
+        start_worker_metrics(
+            port,
+            health=health,
+            bind=os.getenv("FRAUDWATCH_METRICS_BIND", "127.0.0.1"),
+        )
+        logger.info(
+            "Label health and metrics: http://127.0.0.1:%s/readyz", port
+        )
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BROKERS,
         "group.id": KAFKA_GROUP_ID,
@@ -345,11 +357,16 @@ def main():
         "enable.auto.offset.store": False,
     })
 
+    def assignment(event, partitions):
+        partitions = list(partitions)
+        metrics.assignment(event, partitions)
+        health.assignment(event, partitions)
+
     consumer.subscribe(
         [KAFKA_TOPIC],
-        on_assign=lambda _consumer, partitions: metrics.assignment("assigned", partitions),
-        on_revoke=lambda _consumer, partitions: metrics.assignment("revoked", partitions),
-        on_lost=lambda _consumer, partitions: metrics.assignment("lost", partitions),
+        on_assign=lambda _consumer, partitions: assignment("assigned", partitions),
+        on_revoke=lambda _consumer, partitions: assignment("revoked", partitions),
+        on_lost=lambda _consumer, partitions: assignment("lost", partitions),
     )
     shutdown = ShutdownController()
 
@@ -365,6 +382,7 @@ def main():
                 autocommit=True,
                 prepare_threshold=DB_PREPARE_THRESHOLD,
             ) as conn:
+                health.set_component("database", True)
 
                 while not shutdown.requested:
                     assigned_partitions = max(1, len(consumer.assignment()))
@@ -376,6 +394,7 @@ def main():
                         timeout=BATCH_WAIT_SECONDS,
                     )
                     metrics.polled()
+                    health.heartbeat()
 
                     # If shutdown arrived during poll, leave this fetched record
                     # unacknowledged for the next group member/restart.
@@ -452,6 +471,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("Stopping label worker")
     finally:
+        health.stop()
         if shutdown.requested:
             logger.info(
                 "Stopping label worker after signal %s",

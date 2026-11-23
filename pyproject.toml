@@ -18,6 +18,11 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+tooling = [
+    "pip-tools==7.7.0",
+    "setuptools==84.2.1",
+    "wheel==0.48.0",
+]
 mlops = [
     "mlflow>=3.7,<4",
 ]

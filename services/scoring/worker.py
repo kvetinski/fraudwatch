@@ -49,7 +49,7 @@ from fraudwatch_ml.locks import lock_terminal, lock_transaction
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 from fraudwatch_ml.profiling import EventTimings, RollingProfiler
 from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
-from fraudwatch_ml.observability import ScoringMetrics, start_worker_metrics
+from fraudwatch_ml.observability import ScoringMetrics, WorkerHealth, start_worker_metrics
 from fraudwatch_ml.json_logging import configure_json_logging
 from fraudwatch_ml.terminal_order import (
     TerminalQuarantined, block_for_late_event, quarantine_blocked_terminal,
@@ -763,17 +763,30 @@ def main() -> None:
     if DB_PREPARE_THRESHOLD < 0:
         raise ValueError("FRAUDWATCH_DB_PREPARE_THRESHOLD must be nonnegative")
 
-    scorer = load_scorer()
     metrics = ScoringMetrics()
+    health = WorkerHealth(
+        ("model", "database", "kafka"),
+        heartbeat_timeout=float(
+            os.getenv("FRAUDWATCH_WORKER_HEARTBEAT_TIMEOUT_SECONDS", "15")
+        ),
+    )
+    if os.getenv("FRAUDWATCH_METRICS_ENABLED", "1") == "1":
+        port = int(os.getenv("FRAUDWATCH_SCORING_METRICS_PORT", "9101"))
+        start_worker_metrics(
+            port,
+            health=health,
+            bind=os.getenv("FRAUDWATCH_METRICS_BIND", "127.0.0.1"),
+        )
+        logger.info(
+            "Scoring health and metrics: http://127.0.0.1:%s/readyz", port
+        )
+    scorer = load_scorer()
+    health.set_component("model", True)
     metrics.set_model_identity(
         model_reference=scorer.model_reference,
         model_digest=scorer.model_digest,
         feature_schema_version=FEATURE_SCHEMA_VERSION,
     )
-    if os.getenv("FRAUDWATCH_METRICS_ENABLED", "1") == "1":
-        port = int(os.getenv("FRAUDWATCH_SCORING_METRICS_PORT", "9101"))
-        start_worker_metrics(port, bind=os.getenv("FRAUDWATCH_METRICS_BIND", "127.0.0.1"))
-        logger.info("Scoring /metrics: http://127.0.0.1:%s/metrics", port)
     consumer = Consumer(
         {
             "bootstrap.servers": KAFKA_BROKERS,
@@ -783,11 +796,16 @@ def main() -> None:
             "enable.auto.offset.store": False,
         }
     )
+    def assignment(event, partitions):
+        partitions = list(partitions)
+        metrics.assignment(event, partitions)
+        health.assignment(event, partitions)
+
     consumer.subscribe(
         [KAFKA_TOPIC],
-        on_assign=lambda _consumer, partitions: metrics.assignment("assigned", partitions),
-        on_revoke=lambda _consumer, partitions: metrics.assignment("revoked", partitions),
-        on_lost=lambda _consumer, partitions: metrics.assignment("lost", partitions),
+        on_assign=lambda _consumer, partitions: assignment("assigned", partitions),
+        on_revoke=lambda _consumer, partitions: assignment("revoked", partitions),
+        on_lost=lambda _consumer, partitions: assignment("lost", partitions),
     )
     shutdown = ShutdownController()
     logger.info(
@@ -812,6 +830,7 @@ def main() -> None:
                 autocommit=True,
                 prepare_threshold=DB_PREPARE_THRESHOLD,
             ) as conn:
+                health.set_component("database", True)
                 while not shutdown.requested:
                     assigned_partitions = max(1, len(consumer.assignment()))
                     messages = consumer.consume(
@@ -822,6 +841,7 @@ def main() -> None:
                         timeout=BATCH_WAIT_SECONDS,
                     )
                     metrics.polled()
+                    health.heartbeat()
                     # Do not begin another database transaction after shutdown.
                     # Records fetched by this consume remain unacknowledged.
                     if shutdown.requested:
@@ -907,6 +927,7 @@ def main() -> None:
         )
         raise
     finally:
+        health.stop()
         if processed:
             logger.info("quarantined_total=%d", quarantined_count)
             log_profile(profiler, processed, new_decisions)

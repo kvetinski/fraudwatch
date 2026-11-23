@@ -17,7 +17,8 @@ obs-config: ## Validate Compose, Loki, and Alloy configurations
 		$(ALLOY_IMAGE) validate /etc/alloy/config.alloy
 
 obs-up: ## Start the complete local monitoring/logging stack (preserve volumes)
-	@$(OBS_COMPOSE) up -d --build monitor prometheus alertmanager loki alloy grafana
+	@eval "$$($(PYTHON3) scripts/image_identity.py --source-only)"; \
+		$(OBS_COMPOSE) up -d --build monitor prometheus alertmanager loki alloy grafana
 
 obs-stop: ## Stop monitoring without stopping Kafka or PostgreSQL
 	@$(OBS_COMPOSE) stop grafana alloy loki alertmanager prometheus monitor

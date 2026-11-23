@@ -16,7 +16,9 @@ __pycache__
 *.parquet
 *.csv
 data
-artifacts
+artifacts/**
+!artifacts/candidate-model/
+!artifacts/candidate-model/**
 mlruns
 mlartifacts
 review

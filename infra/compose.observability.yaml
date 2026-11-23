@@ -3,13 +3,15 @@
 # Start with: make obs-up
 services:
   monitor:
-    image: fraudwatch/python-workers:local
+    image: fraudwatch/monitor:${FRAUDWATCH_APP_TAG:-development}
     build:
       context: ..
       dockerfile: infra/docker/python.Dockerfile
       network: host
+      target: monitor
+      args:
+        FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
     network_mode: host
-    command: ["python", "services/monitor/monitor.py"]
     environment:
       DATABASE_URL: "postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch?sslmode=disable&options=-cdefault_transaction_read_only%3Don"
       KAFKA_BROKERS: 127.0.0.1:9092
@@ -23,6 +25,14 @@ services:
       retries: 4
       start_period: 20s
     restart: unless-stopped
+    read_only: true
+    init: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
 
   prometheus:
     image: prom/prometheus:v3.5.0

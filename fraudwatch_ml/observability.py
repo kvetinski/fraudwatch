@@ -7,11 +7,14 @@ service so they remain fresh while a worker is stopped or rebalancing.
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
 
-from prometheus_client import Counter, Gauge, Histogram, Info, REGISTRY, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, Info, REGISTRY, generate_latest
 
 STAGE_BUCKETS = (
     0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.003,
@@ -22,11 +25,110 @@ SCORE_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 0.95,
 BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000)
 
 
-def start_worker_metrics(port: int, *, bind: str = "127.0.0.1"):
-    """Run a /metrics HTTP endpoint on a daemon thread."""
+class WorkerHealth:
+    """Thread-safe liveness/readiness state for a Kafka database worker."""
+
+    def __init__(self, required_components: Iterable[str], *,
+                 heartbeat_timeout: float = 15.0, clock=time.monotonic):
+        if heartbeat_timeout <= 0:
+            raise ValueError("heartbeat_timeout must be positive")
+        self._components = {name: False for name in required_components}
+        if not self._components:
+            raise ValueError("At least one readiness component is required")
+        self._heartbeat_timeout = heartbeat_timeout
+        self._clock = clock
+        self._last_heartbeat: float | None = None
+        self._assigned_partitions = 0
+        self._stopping = False
+        self._lock = threading.Lock()
+
+    def set_component(self, name: str, ready: bool) -> None:
+        with self._lock:
+            if name not in self._components:
+                raise KeyError(f"Unknown readiness component: {name}")
+            self._components[name] = ready
+
+    def assignment(self, event: str, partitions: Iterable[object]) -> None:
+        count = len(list(partitions)) if event == "assigned" else 0
+        with self._lock:
+            self._assigned_partitions = count
+            if "kafka" in self._components:
+                self._components["kafka"] = count > 0
+
+    def heartbeat(self) -> None:
+        with self._lock:
+            self._last_heartbeat = self._clock()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopping = True
+
+    def snapshot(self) -> dict[str, object]:
+        now = self._clock()
+        with self._lock:
+            age = (
+                None if self._last_heartbeat is None
+                else max(0.0, now - self._last_heartbeat)
+            )
+            ready = (
+                not self._stopping
+                and all(self._components.values())
+                and self._assigned_partitions > 0
+                and age is not None
+                and age <= self._heartbeat_timeout
+            )
+            return {
+                "status": "ready" if ready else "not_ready",
+                "ready": ready,
+                "stopping": self._stopping,
+                "components": dict(self._components),
+                "assigned_partitions": self._assigned_partitions,
+                "heartbeat_age_seconds": age,
+                "heartbeat_timeout_seconds": self._heartbeat_timeout,
+            }
+
+
+def start_worker_metrics(port: int, *, health: WorkerHealth,
+                         bind: str = "127.0.0.1", registry=REGISTRY):
+    """Serve metrics plus Kubernetes-style liveness and readiness endpoints."""
     if not 0 < port < 65536:
         raise ValueError("Invalid Prometheus metrics port")
-    return start_http_server(port, addr=bind)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+            if self.path == "/metrics":
+                payload = generate_latest(registry)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+            elif self.path == "/livez":
+                payload = b'{"status":"alive"}\n'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+            elif self.path == "/readyz":
+                snapshot = health.snapshot()
+                payload = (json.dumps(snapshot, sort_keys=True) + "\n").encode()
+                self.send_response(200 if snapshot["ready"] else 503)
+                self.send_header("Content-Type", "application/json")
+            else:
+                payload = b'{"error":"not found"}\n'
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *args):
+            return
+
+    server = ThreadingHTTPServer((bind, port), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name=f"fraudwatch-worker-http-{port}",
+        daemon=True,
+    )
+    thread.start()
+    return server, thread
 
 
 class ConsumerRuntimeMetrics:

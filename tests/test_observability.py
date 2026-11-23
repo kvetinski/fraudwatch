@@ -1,6 +1,17 @@
+import json
+import socket
+import urllib.error
+import urllib.request
+
+import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
-from fraudwatch_ml.observability import ScoringMetrics, LabelMetrics
+from fraudwatch_ml.observability import (
+    LabelMetrics,
+    ScoringMetrics,
+    WorkerHealth,
+    start_worker_metrics,
+)
 
 
 class FakeTimings:
@@ -68,3 +79,56 @@ def test_total_latency_covers_duplicate_and_quarantine_outcomes():
     )
     data = generate_latest(registry).decode()
     assert 'fraudwatch_scoring_stage_seconds_count{stage="total"} 2.0' in data
+
+
+def test_worker_readiness_requires_dependencies_assignment_and_fresh_heartbeat():
+    now = [100.0]
+    health = WorkerHealth(
+        ("model", "database", "kafka"),
+        heartbeat_timeout=5,
+        clock=lambda: now[0],
+    )
+    health.set_component("model", True)
+    health.set_component("database", True)
+    health.assignment("assigned", [object()])
+    health.heartbeat()
+    assert health.snapshot()["ready"] is True
+
+    now[0] += 6
+    assert health.snapshot()["ready"] is False
+    health.heartbeat()
+    health.assignment("revoked", [object()])
+    assert health.snapshot()["components"]["kafka"] is False
+    assert health.snapshot()["ready"] is False
+
+
+def test_worker_http_separates_liveness_from_readiness():
+    health = WorkerHealth(("database", "kafka"))
+    registry = CollectorRegistry()
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    server, thread = start_worker_metrics(
+        port, health=health, registry=registry
+    )
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/livez", timeout=2
+        ) as response:
+            assert response.status == 200
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/readyz", timeout=2
+            )
+        assert failure.value.code == 503
+        health.set_component("database", True)
+        health.assignment("assigned", [object()])
+        health.heartbeat()
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/readyz", timeout=2
+        ) as response:
+            assert json.load(response)["ready"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

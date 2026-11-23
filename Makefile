@@ -16,9 +16,11 @@ STACK_COMPOSE := docker compose -f infra/compose.yaml \
 	-f infra/compose.observability.yaml
 PYTHON3 ?= /usr/bin/python3
 PY := .venv/bin/python
+PIP_COMPILE := .venv/bin/pip-compile
 MLFLOW := .venv/bin/mlflow
 GO_DIR := services/ingestion
 TEST_DATABASE_URL ?= postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch_test?sslmode=disable
+DATABASE_URL ?= postgres://fraudwatch:fraudwatch_dev@127.0.0.1:5434/fraudwatch?sslmode=disable
 DATA_REPO := https://github.com/Fraud-Detection-Handbook/simulated-data-raw.git
 REPLAY_RUN_ID ?=
 REPLAY_MODE ?= kafka
@@ -26,7 +28,7 @@ REPLAY_ARGS ?=
 EVALUATION_RUN_ID ?=
 EVALUATION_ARGS ?=
 
-.PHONY: help check venv install data kafka-permissions up down stop-all down-all status \
+.PHONY: help check venv lock-tools lock install data kafka-permissions up down stop-all down-all status \
         wait-db init-test-db migrate wait-kafka topics go-deps \
         model-bootstrap train mlflow-ui smoke benchmark-replay evaluate-replay \
         run-api run-scoring run-labels \
@@ -46,8 +48,22 @@ check: ## Check tools required for first-time bootstrap
 venv: ## Create .venv if needed
 	@if [ ! -x "$(PY)" ]; then "$(PYTHON3)" -m venv .venv; fi
 
-install: venv ## Install Python package and dev/MLOps/streaming dependencies
-	@$(PY) -m pip install -e '.[dev,mlops,streaming]'
+lock-tools: venv ## Install the pinned dependency-lock generator
+	@$(PY) -m pip install 'pip-tools==7.7.0'
+
+lock: lock-tools ## Regenerate hash-verified Python runtime and development locks
+	@$(PIP_COMPILE) --generate-hashes --strip-extras \
+		--no-emit-index-url --no-emit-trusted-host \
+		--extra mlops --extra streaming \
+		-o requirements/runtime.lock pyproject.toml
+	@$(PIP_COMPILE) --generate-hashes --strip-extras \
+		--allow-unsafe --no-emit-index-url --no-emit-trusted-host \
+		--extra dev --extra tooling --extra mlops --extra streaming \
+		-o requirements/dev.lock pyproject.toml
+
+install: venv ## Install the hash-verified development environment
+	@$(PY) -m pip install --require-hashes -r requirements/dev.lock
+	@$(PY) -m pip install --no-deps --no-build-isolation -e .
 
 data: ## Clone trusted simulated fraud data only if missing
 	@if [ ! -d data/handbook-raw/.git ]; then \
@@ -113,6 +129,10 @@ clean-all: ## DESTRUCTIVE: stop stack and delete all local state (CONFIRM=clean-
 		"$(CURDIR)/mlruns"
 	@find "$(CURDIR)" -maxdepth 1 -type f -name 'mlflow.db*' -delete
 	-@docker image rm fraudwatch/ingestion:local fraudwatch/python-workers:local >/dev/null 2>&1
+	-@images="$$(docker image ls \
+		--filter 'label=org.opencontainers.image.source=https://github.com/kvetinski/fraudwatch' \
+		--format '{{.ID}}' | sort -u)"; \
+		if [ -n "$$images" ]; then docker image rm $$images >/dev/null 2>&1; fi
 	@echo 'Full local reset complete. Source files, Git metadata, .env files, and review/ were preserved.'
 
 wait-db: up ## Wait for PostgreSQL to accept connections
@@ -130,14 +150,9 @@ init-test-db: wait-db ## Create separate integration-test database if absent
 	fi
 
 migrate: init-test-db ## Apply numbered SQL migrations to app and test databases
-	@for db in fraudwatch fraudwatch_test; do \
-		for file in infra/migrations/*.sql; do \
-			[ -f "$$file" ] || { echo 'No SQL migrations found' >&2; exit 1; }; \
-			echo "Applying $$file to $$db"; \
-			$(COMPOSE) exec -T postgres \
-				psql -v ON_ERROR_STOP=1 -U fraudwatch -d "$$db" < "$$file"; \
-		done; \
-	done
+	@$(PY) scripts/migrate_database.py \
+		--database-url "$(DATABASE_URL)" \
+		--database-url "$(TEST_DATABASE_URL)"
 
 wait-kafka: up ## Wait for Kafka to respond to a metadata request
 	@for i in $$(seq 1 60); do \
@@ -216,3 +231,5 @@ setup: check install data up migrate topics go-deps model-bootstrap ## Bootstrap
 -include infra/observability/Makefile.alerts.inc
 
 -include infra/Makefile.app.inc
+
+-include infra/k8s/Makefile.inc

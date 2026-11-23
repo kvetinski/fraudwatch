@@ -1,0 +1,11 @@
+{
+  "uid": "fraudwatch-kubernetes", "title": "FraudWatch — Kubernetes", "tags": ["fraudwatch", "kubernetes"],
+  "timezone": "browser", "schemaVersion": 41, "version": 1, "refresh": "10s", "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {"id": 1, "title": "Available deployment replicas", "type": "timeseries", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "kube_deployment_status_replicas_available{namespace=\"fraudwatch\"}", "legendFormat": "{{deployment}}"}]},
+    {"id": 2, "title": "Unavailable deployment replicas", "type": "stat", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "kube_deployment_status_replicas_unavailable{namespace=\"fraudwatch\"}", "legendFormat": "{{deployment}}"}], "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []}},
+    {"id": 3, "title": "Container restarts", "type": "timeseries", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "increase(kube_pod_container_status_restarts_total{namespace=\"fraudwatch\"}[15m])", "legendFormat": "{{pod}} / {{container}}"}]},
+    {"id": 4, "title": "Crash-looping containers", "type": "stat", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}, "targets": [{"refId": "A", "expr": "kube_pod_container_status_waiting_reason{namespace=\"fraudwatch\",reason=\"CrashLoopBackOff\"}", "legendFormat": "{{pod}} / {{container}}"}], "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []}},
+    {"id": 5, "title": "Recent FraudWatch logs", "type": "logs", "gridPos": {"x": 0, "y": 16, "w": 24, "h": 10}, "datasource": {"type": "loki", "uid": "fraudwatch-loki"}, "targets": [{"refId": "A", "expr": "{namespace=\"fraudwatch\"}"}]}
+  ]
+}

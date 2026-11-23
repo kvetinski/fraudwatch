@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-monitor
+  labels:
+    app.kubernetes.io/name: model-monitor
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-monitor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-monitor
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: model-monitor
+          image: fraudwatch/model-monitor:development
+          imagePullPolicy: IfNotPresent
+          args:
+            - --database-url
+            - $(DATABASE_URL)
+            - schedule
+            - --baseline
+            - /models/candidate/monitoring-baseline.json
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: fraudwatch-secrets, key: DATABASE_URL}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 128Mi}
+      terminationGracePeriodSeconds: 30

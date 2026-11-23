@@ -4,6 +4,13 @@
 # host's working DNS/VPN routes. Runtime containers still use Compose networks.
 # Prometheus/Grafana remain managed by infra/compose.observability.yaml,
 # using host networking to scrape loopback-only published worker metrics.
+x-app-security: &app-security
+  read_only: true
+  init: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+
 services:
   kafka:
     healthcheck:
@@ -14,11 +21,14 @@ services:
       start_period: 45s
 
   ingestion:
-    image: fraudwatch/ingestion:local
+    <<: *app-security
+    image: fraudwatch/ingestion:${FRAUDWATCH_APP_TAG:-development}
     build:
       context: ../services/ingestion
       dockerfile: Dockerfile
       network: host
+      args:
+        FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
     environment:
       DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
       KAFKA_BROKERS: kafka:19092
@@ -34,20 +44,28 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 15s
       timeout: 3s
       retries: 5
       start_period: 15s
     restart: unless-stopped
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
 
   scoring:
-    image: fraudwatch/python-workers:local
+    <<: *app-security
+    image: fraudwatch/scoring:${FRAUDWATCH_SCORING_TAG:-development}
     build:
       context: ..
       dockerfile: infra/docker/python.Dockerfile
       network: host
-    command: ["python", "services/scoring/worker.py"]
+      target: scoring
+      args:
+        FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
+        FRAUDWATCH_MODEL_DIGEST: ${FRAUDWATCH_MODEL_DIGEST:-unknown}
+        FRAUDWATCH_MODEL_BUNDLE_DIGEST: ${FRAUDWATCH_MODEL_BUNDLE_DIGEST:-unknown}
     environment:
       DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
       KAFKA_BROKERS: kafka:19092
@@ -59,13 +77,6 @@ services:
       FRAUDWATCH_SCORING_BATCH_SIZE_PER_PARTITION: "8"
       FRAUDWATCH_SCORING_BATCH_WAIT_SECONDS: "0.025"
       FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
-    volumes:
-      - type: bind
-        source: ../artifacts/candidate-model
-        target: /models/candidate
-        read_only: true
-        bind:
-          create_host_path: false
     ports:
       - "127.0.0.1:9101:9101"
     depends_on:
@@ -74,20 +85,26 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9101/metrics', timeout=2).close()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9101/readyz', timeout=2).close()"]
       interval: 15s
       timeout: 5s
       retries: 4
       start_period: 45s
     restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
 
   labels:
-    image: fraudwatch/python-workers:local
+    <<: *app-security
+    image: fraudwatch/labels:${FRAUDWATCH_APP_TAG:-development}
     build:
       context: ..
       dockerfile: infra/docker/python.Dockerfile
       network: host
-    command: ["python", "services/scoring/label_worker.py"]
+      target: labels
+      args:
+        FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
     environment:
       DATABASE_URL: postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable
       KAFKA_BROKERS: kafka:19092
@@ -105,26 +122,50 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9102/metrics', timeout=2).close()"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9102/readyz', timeout=2).close()"]
       interval: 15s
       timeout: 5s
       retries: 4
       start_period: 30s
     restart: unless-stopped
+    pids_limit: 192
+    mem_limit: 512m
+    cpus: 1.0
 
   model-monitor-evaluator:
-    image: fraudwatch/python-workers:local
-    command: ["python", "scripts/model_monitor.py", "--database-url", "postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable", "schedule", "--baseline", "/models/candidate/monitoring-baseline.json"]
+    <<: *app-security
+    image: fraudwatch/model-monitor:${FRAUDWATCH_SCORING_TAG:-development}
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+      network: host
+      target: model-monitor
+      args:
+        FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
+        FRAUDWATCH_MODEL_DIGEST: ${FRAUDWATCH_MODEL_DIGEST:-unknown}
+        FRAUDWATCH_MODEL_BUNDLE_DIGEST: ${FRAUDWATCH_MODEL_BUNDLE_DIGEST:-unknown}
+    command: ["--database-url", "postgres://fraudwatch:fraudwatch_dev@postgres:5432/fraudwatch?sslmode=disable", "schedule", "--baseline", "/models/candidate/monitoring-baseline.json"]
     environment:
       FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
-    volumes:
-      - type: bind
-        source: ../artifacts/candidate-model
-        target: /models/candidate
-        read_only: true
-        bind:
-          create_host_path: false
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    pids_limit: 192
+    mem_limit: 1g
+    cpus: 1.0
+
+  operations:
+    <<: *app-security
+    image: fraudwatch/operations:${FRAUDWATCH_APP_TAG:-development}
+    profiles: [tools]
+    build:
+      context: ..
+      dockerfile: infra/docker/python.Dockerfile
+      network: host
+      target: operations
+      args:
+        FRAUDWATCH_BUILD_REVISION: ${FRAUDWATCH_BUILD_REVISION:-development}
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0

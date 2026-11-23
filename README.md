@@ -6,10 +6,11 @@ Prometheus, Grafana, Alertmanager, Loki, and Alloy. It accepts transactions thro
 transactional outbox, scores them from the stream, stores decisions and
 terminal history, and exposes operational metrics and alerts.
 
-The repository currently targets a single-machine Linux environment. It has
-useful reliability controls and container definitions, but it is not yet a
-production deployment: CI/CD, Kubernetes manifests, authentication, TLS, and
-secret management are still to be added.
+The repository targets a single-machine Linux environment. It includes
+Compose development, a persistent Minikube deployment, an ephemeral Kind CI
+deployment, and GitHub Actions gates. It is not a production deployment:
+authentication, TLS, external secret management, and multi-node data-service
+high availability remain outside the local scope.
 
 ## Architecture
 
@@ -110,6 +111,8 @@ to UTC.
 - Python 3.12 with `venv`
 - Go 1.26 or a compatible version for the ingestion module
 - GNU Make and Git
+- Minikube and kubectl for the persistent local Kubernetes deployment
+- Kind for reproducing the ephemeral CI deployment
 
 The setup process clones the simulated dataset from the Fraud Detection
 Handbook repository and downloads Python, Go, and container dependencies.
@@ -130,6 +133,10 @@ bootstraps an MLflow candidate model. `make obs-install` remains available as a
 small standalone metrics-client installation target; `make install` already
 includes it through the streaming dependencies.
 
+Python installation and container builds consume hash-verified locks under
+`requirements/`. Change dependency ranges in `pyproject.toml`, run `make lock`,
+review both lock-file diffs, and then run `make install`. Never hand-edit a lock.
+
 Run the host processes in separate terminals:
 
 ```bash
@@ -145,7 +152,9 @@ Useful endpoints:
 | Ingestion liveness | `http://127.0.0.1:8080/livez` |
 | Ingestion readiness | `http://127.0.0.1:8080/readyz` |
 | Ingestion metrics | `http://127.0.0.1:8080/metrics` |
+| Scoring liveness/readiness | `http://127.0.0.1:9101/livez`, `/readyz` |
 | Scoring metrics | `http://127.0.0.1:9101/metrics` |
+| Label liveness/readiness | `http://127.0.0.1:9102/livez`, `/readyz` |
 | Label metrics | `http://127.0.0.1:9102/metrics` |
 | Independent monitor | `http://127.0.0.1:9103/metrics` |
 | MLflow UI (`make mlflow-ui`) | `http://127.0.0.1:5001` |
@@ -230,6 +239,23 @@ free. The exported candidate model under `artifacts/candidate-model/` is a
 generated, read-only deployment bundle and is intentionally excluded from Git.
 Re-export it whenever the MLflow candidate changes.
 
+`make app-build` produces separate ingestion, scoring, label, model-monitor,
+and operations images. Base images are digest-pinned; Python dependencies are
+installed with `--require-hashes`; scoring/model-monitor images contain the
+read-only model bundle and carry its digest as image metadata. `make
+app-identity` shows the exact tags. A clean worktree uses the Git revision;
+local changes add a deterministic dirty-source digest, and scoring tags also
+include the model and complete bundle digests. The Compose services run as
+non-root with a read-only root filesystem, all Linux capabilities dropped, no
+privilege escalation, a
+bounded temporary filesystem, and explicit CPU, memory, and PID limits.
+
+Worker liveness only states that the process and HTTP server are running.
+Readiness additionally requires PostgreSQL, a live Kafka partition assignment,
+a fresh consume-loop heartbeat, and—on scoring—the loaded model. Readiness goes
+false during rebalance, stalled polling, startup, and shutdown. Compose uses
+`/readyz`; use `/livez` only for process-restart decisions.
+
 Application image builds use the host network for dependency downloads. This
 lets builds follow the Linux host's working DNS and VPN routes when Docker's
 default build bridge cannot reach package repositories. This setting applies
@@ -251,6 +277,56 @@ resolved from the first file:
 ```bash
 docker compose -f infra/compose.yaml -f infra/compose.app.yaml config
 ```
+
+## Local Kubernetes deployment
+
+Export a trusted candidate model first, then deploy the application,
+PostgreSQL, three-partition single-node Kafka, and the observability stack into
+the dedicated persistent Minikube profile named `fraudwatch`:
+
+```bash
+make app-export-model       # omit when artifacts/candidate-model already exists
+make k8s-local-up
+make k8s-local-status
+make k8s-local-smoke
+```
+
+`k8s-local-up` creates ignored mode-0600 credentials on first use, starts only
+the `fraudwatch` profile, builds and loads exact source/model-tagged images,
+waits for the Kubernetes API, applies PostgreSQL and Kafka, runs the checksum
+migration and topic Jobs, and then rolls out applications. Every mutating
+command refuses to run unless the active context is exactly `fraudwatch`.
+The smoke test checks liveness, readiness, and metrics, submits a unique
+transaction, proves its outbox delivery and persisted fraud decision, verifies
+Prometheus application and Kubernetes discovery, and finds the transaction's
+structured ingestion log in Loki.
+
+Forward the API in a foreground terminal when you want to call it manually:
+
+```bash
+make k8s-local-port-forward
+# API: http://127.0.0.1:8080
+
+make k8s-local-grafana
+# Grafana: http://127.0.0.1:3000
+```
+
+Grafana's username is `admin`; its generated password is the
+`GRAFANA_ADMIN_PASSWORD` value in the ignored mode-0600 local environment file.
+The Kubernetes stack provisions Prometheus, Alertmanager, Grafana, Loki,
+Alloy, kube-state-metrics, the shared alert rules, and all five dashboards.
+
+Real credentials live in `infra/k8s/fraudwatch.local.env`, which is ignored.
+[`infra/k8s/fraudwatch.env.example`](infra/k8s/fraudwatch.env.example) documents
+the required keys. Do not commit the generated file. Stop the local cluster
+without losing its volumes using `make k8s-local-stop`. Deleting the profile
+and its data requires `make k8s-local-delete CONFIRM=fraudwatch`.
+
+CI creates `kind-fraudwatch-ci`, builds a small synthetic CI-only model bundle,
+loads the same role images, applies the `ci` Kustomize overlay, and runs the
+same smoke test. The real model bundle remains ignored and is never published
+by CI. See [`docs/deployment.md`](docs/deployment.md) for deployment order,
+rollout, rollback, and troubleshooting details.
 
 ## Observability and alerts
 
@@ -538,7 +614,9 @@ infra/compose.yaml              Kafka and PostgreSQL
 infra/compose.app.yaml          local application-container overlay
 infra/compose.observability.yaml local metrics, alerting, dashboards, and logs
 infra/migrations/               ordered PostgreSQL schema files
+infra/k8s/                      Kustomize bases, local/CI overlays, and lifecycle
 infra/observability/            Prometheus/Grafana/Alertmanager/Loki/Alloy config
+.github/workflows/              clean-checkout test and Kind E2E gates
 scripts/                        setup, training, replay, verification, and operations
 tests/                          Python unit and PostgreSQL integration tests
 ```
@@ -552,13 +630,16 @@ The baseline is intentionally explicit about its remaining gaps:
 
 - Terminal-order reconciliation is intentionally operator-driven and currently
   replays one terminal at a time in memory; bulk recovery scheduling is absent.
-- Python dependencies have ranges but no resolved lock file, and observability
-  image pins are maintained manually rather than by a dependency updater.
-- SQL migrations are replayable files but have no migration ledger or checksum
-  enforcement.
-- There is no CI pipeline, image publication workflow, or local Kubernetes
-  deployment yet. Kubernetes ServiceMonitors, kube-state-metrics, and
-  crash-loop alerts belong to Phase 4.2.
+- Python dependencies are hash-locked, but automated dependency and base-image
+  update pull requests are not configured yet.
+- SQL migrations are checksum-verified and serialized by an advisory lock, but
+  rollback migrations remain operator-authored rather than automatic.
+- CI validates tests and an ephemeral Kind deployment, but immutable GHCR
+  publication, provenance attestations, SBOM publication, and automated
+  dependency updates are not configured yet.
+- The local Kubernetes observability services are single-replica and use
+  node-local persistent volumes; they are designed for development rather
+  than highly available monitoring.
 - Alertmanager has no external notification destination in the checked-in
   local configuration, and distributed tracing is intentionally deferred.
 - Local credentials are development defaults; the services have no TLS,

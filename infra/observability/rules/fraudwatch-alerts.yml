@@ -18,6 +18,22 @@ groups:
           summary: "FraudWatch independent monitoring is stale"
           description: "Kafka and PostgreSQL state has not been collected successfully for more than two minutes."
 
+      - alert: FraudWatchKubernetesDeploymentUnavailable
+        expr: kube_deployment_status_replicas_unavailable{namespace="fraudwatch"} > 0
+        for: 5m
+        labels: {severity: critical, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch Kubernetes deployment is unavailable"
+          description: "Deployment {{ $labels.deployment }} has unavailable replicas for five minutes."
+
+      - alert: FraudWatchKubernetesCrashLoop
+        expr: kube_pod_container_status_waiting_reason{namespace="fraudwatch",reason="CrashLoopBackOff"} > 0
+        for: 5m
+        labels: {severity: critical, service: fraudwatch}
+        annotations:
+          summary: "FraudWatch container is crash-looping"
+          description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is in CrashLoopBackOff."
+
   - name: fraudwatch-streaming
     interval: 30s
     rules:

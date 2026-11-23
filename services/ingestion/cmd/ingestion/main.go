@@ -33,6 +33,8 @@ const (
 
 var ErrConflict = errors.New("transaction ID already has a different payload")
 
+var buildRevision = "development"
+
 var strictRFC3339 = regexp.MustCompile(
 	`^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T` +
 		`([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]` +
@@ -281,7 +283,7 @@ func newRequestID() string {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(
 		"service", "ingestion",
-		"build_revision", envOrDefault("FRAUDWATCH_BUILD_REVISION", "development"),
+		"build_revision", envOrDefault("FRAUDWATCH_BUILD_REVISION", buildRevision),
 	)
 	slog.SetDefault(logger)
 	dsn := os.Getenv("DATABASE_URL")
@@ -334,7 +336,7 @@ func main() {
 	)
 	defer stop()
 
-	metrics := newIngestionMetrics(envOrDefault("FRAUDWATCH_BUILD_REVISION", "development"))
+	metrics := newIngestionMetrics(envOrDefault("FRAUDWATCH_BUILD_REVISION", buildRevision))
 	// Publication failures do not prevent HTTP acceptance.
 	publisherDone := make(chan struct{})
 	go func() {

@@ -1,0 +1,56 @@
+discovery.kubernetes "fraudwatch_pods" {
+  role = "pod"
+
+  namespaces {
+    names = ["fraudwatch"]
+  }
+}
+
+discovery.relabel "fraudwatch_pods" {
+  targets = discovery.kubernetes.fraudwatch_pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_part_of"]
+    regex         = "fraudwatch"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+    target_label  = "service_name"
+  }
+}
+
+loki.source.kubernetes "fraudwatch_pods" {
+  targets    = discovery.relabel.fraudwatch_pods.output
+  forward_to = [loki.process.fraudwatch.receiver]
+}
+
+loki.process "fraudwatch" {
+  stage.cri {}
+  stage.static_labels {
+    values = {environment = "kubernetes"}
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

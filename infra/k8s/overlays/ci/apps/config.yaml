@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fraudwatch-config
+  namespace: fraudwatch
+data:
+  FRAUDWATCH_MONITOR_INTERVAL_SECONDS: "5"

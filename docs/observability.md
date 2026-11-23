@@ -57,6 +57,8 @@ them after representative production windows accumulate.
 
 ## Local operation
 
+For the Compose-based development stack:
+
 ```bash
 make obs-config
 make obs-up
@@ -75,6 +77,21 @@ Useful labels are `service_name`, `container`, and `environment="local"`.
 Application JSON contains timestamp, severity, service, build revision,
 message, and contextual outcome/source fields. Raw payloads and monetary
 values must never be logged.
+
+For the persistent Minikube stack, observability is installed automatically by
+`make k8s-local-up`:
+
+```bash
+make k8s-local-smoke
+make k8s-local-grafana
+```
+
+The smoke test proves application pod discovery, kube-state-metrics ingestion,
+and log delivery through Alloy into Loki. Grafana is available only through
+the foreground loopback port-forward. Sign in as `admin` using
+`GRAFANA_ADMIN_PASSWORD` from the ignored `infra/k8s/fraudwatch.local.env`.
+Kubernetes log labels include `namespace`, `pod`, `container`,
+`service_name`, and `environment="kubernetes"`.
 
 ## Triage order
 

@@ -3,6 +3,7 @@
 .env
 .env.*
 !.env.example
+infra/k8s/fraudwatch.local.env
 
 # Python build and test output
 __pycache__/

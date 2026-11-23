@@ -144,14 +144,14 @@ def test_replay_preserves_original_and_promotes_atomically():
 
     salt = uuid.uuid4().hex
     terminal_id = f"reconcile-{salt}"
-    transaction_ids = [f"reconcile-{position}-{salt}" for position in range(3)]
-    late_id, original_id, later_id = transaction_ids
+    transaction_ids = [f"reconcile-{position}-{salt}" for position in range(4)]
+    late_id, original_id, later_id, future_id = transaction_ids
     payloads = {
         original_id: _payload(original_id, terminal_id, "2018-04-10T00:00:00Z"),
         late_id: _payload(late_id, terminal_id, "2018-04-01T00:00:00Z"),
         later_id: _payload(later_id, terminal_id, "2018-04-18T00:00:00Z"),
     }
-    offsets = [uuid.uuid4().int % (2**61) for _ in range(3)]
+    offsets = [uuid.uuid4().int % (2**61) for _ in range(4)]
     scorer = LoadedScorer(
         HistorySensitiveModel(),
         "models:/fraudwatch-hgb/reconciliation-test",
@@ -264,6 +264,37 @@ def test_replay_preserves_original_and_promotes_atomically():
                 """,
                 (late_id,),
             ).fetchone()[0] == 0
+            label_projection = conn.execute(
+                """
+                SELECT fraud_label, label_observed_at
+                FROM scored_transactions
+                WHERE transaction_id = %s
+                """,
+                (late_id,),
+            ).fetchone()
+            assert label_projection[0] == 1
+            assert (
+                label_projection[1].isoformat()
+                == "2018-04-09T00:00:00+00:00"
+            )
+
+            assert _process(
+                conn,
+                scorer,
+                _payload(future_id, terminal_id, "2018-04-20T00:00:00Z"),
+                terminal_id,
+                offsets[3],
+            ) is True
+            future_features = conn.execute(
+                """
+                SELECT feature_vector FROM fraud_decisions
+                WHERE transaction_id = %s
+                """,
+                (future_id,),
+            ).fetchone()[0]
+            assert future_features["terminal_30d_count"] == 2.0
+            assert future_features["terminal_30d_fraud_count"] == 2.0
+            assert future_features["terminal_30d_fraud_rate"] == 1.0
 
             versions = conn.execute(
                 """

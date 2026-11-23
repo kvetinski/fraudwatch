@@ -186,7 +186,7 @@ def store_label(
                     transaction_id, label, observed_at, pending[6]
                 ),
             )
-            _insert_active_label(conn, transaction_id, label, observed_at)
+            insert_active_label(conn, transaction_id, label, observed_at)
             conn.execute(
                 "DELETE FROM pending_fraud_labels WHERE transaction_id = %s",
                 (transaction_id,),
@@ -229,7 +229,7 @@ def store_label(
             ),
             kafka_payload=payload,
         )
-        _insert_active_label(conn, transaction_id, label, observed_at)
+        insert_active_label(conn, transaction_id, label, observed_at)
         return True
 
 
@@ -242,12 +242,13 @@ def _validate_delay(observed_at: datetime, occurred_at: datetime) -> None:
         )
 
 
-def _insert_active_label(
+def insert_active_label(
     conn,
     transaction_id: str,
     label: int,
     observed_at: datetime,
 ) -> None:
+    """Persist an active label and synchronize its online-history projection."""
     conn.execute(
         """
         INSERT INTO fraud_labels (
@@ -361,7 +362,7 @@ def resolve_pending_label(
                 transaction_id, label, observed_at, kafka_payload
             ),
         )
-        _insert_active_label(conn, transaction_id, label, observed_at)
+        insert_active_label(conn, transaction_id, label, observed_at)
         resolution = "activated"
 
     conn.execute(

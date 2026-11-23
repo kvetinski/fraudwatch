@@ -20,7 +20,7 @@ from fraudwatch_ml.features import (
     TERMINAL_WINDOWS_DAYS,
     base_features_one,
 )
-from fraudwatch_ml.labels import parse_label
+from fraudwatch_ml.labels import insert_active_label, parse_label
 from fraudwatch_ml.locks import lock_terminal, lock_transaction
 from fraudwatch_ml.online_features import TerminalHistory
 from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
@@ -1105,13 +1105,11 @@ def promote_run(
                 kafka_key=label.kafka_key,
                 kafka_payload=label.kafka_payload,
             )
-            conn.execute(
-                """
-                INSERT INTO fraud_labels (
-                    transaction_id, fraud_label, observed_at
-                ) VALUES (%s, %s, %s)
-                """,
-                (label.transaction_id, label.fraud_label, label.observed_at),
+            insert_active_label(
+                conn,
+                label.transaction_id,
+                label.fraud_label,
+                label.observed_at,
             )
             conn.execute(
                 "DELETE FROM pending_fraud_labels WHERE transaction_id = %s",

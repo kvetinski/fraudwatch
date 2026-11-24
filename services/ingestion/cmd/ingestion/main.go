@@ -341,7 +341,7 @@ func main() {
 	publisherDone := make(chan struct{})
 	go func() {
 		defer close(publisherDone)
-		runPublisher(ctx, db, kafka, metrics)
+		runPublisher(ctx, dsn, kafka, metrics)
 	}()
 
 	server := &Server{db: db, metrics: metrics}

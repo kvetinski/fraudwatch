@@ -60,9 +60,19 @@ application dashboards, and a Kubernetes workload dashboard.
 Application pods run as UID/GID 10001 with read-only root filesystems, dropped
 capabilities, RuntimeDefault seccomp, bounded temporary volumes, resource
 requests/limits, and no service-account token. PostgreSQL and Kafka use their
-image-native non-root IDs. Scoring and model-monitor rollouts use `Recreate` so
-two model bundles do not process concurrently; parallel scoring replicas are
-safe only when they use the same immutable image.
+image-native non-root IDs. Ingestion uses one replica with `Recreate` because
+the process still combines the HTTP API and outbox publisher; this trades a
+brief API gap during rollout for preventing planned publisher overlap. A
+dedicated PostgreSQL session elects exactly one publisher during any accidental
+or manual overlap, and every ordered batch runs on that leadership session.
+Scoring and model-monitor also use `Recreate` so two model bundles do not
+process concurrently; parallel scoring replicas are safe only when they use
+the same immutable image.
+
+Publisher leadership serializes committed, visible outbox rows by
+`(created_at, transaction_id)`. It does not impose event-time or commit order
+on API transactions that are still concurrently uncommitted; downstream
+terminal-order quarantine remains the safety boundary for late event time.
 
 Exact image tags derive from runtime source inputs. Scoring and model-monitor
 tags additionally include the serialized model and complete bundle digests.

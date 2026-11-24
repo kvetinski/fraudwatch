@@ -73,6 +73,14 @@ reapply that exact image identity. For a scoring rollback, roll back scoring
 and model-monitor together because both tags bind source, model, and baseline.
 Never use a mutable tag or manually replace the model inside a running pod.
 
+Ingestion is a single-replica `Recreate` Deployment because its process embeds
+the ordered outbox publisher. An ingestion rollout therefore has a brief API
+gap, but transactions accepted before the gap remain durable in PostgreSQL and
+publication resumes under database-elected publisher leadership. Clients
+should retry connection failures or `503` responses with the same transaction
+ID. Do not scale the combined Deployment; split the HTTP API and publisher into
+separate workloads before scaling request handling.
+
 ## Verification and troubleshooting
 
 `make k8s-local-smoke` opens temporary loopback port-forwards, checks readiness

@@ -6,11 +6,23 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-const outboxBatchSize = 50
+const (
+	outboxBatchSize         = 50
+	outboxPublisherLockName = "fraudwatch:outbox-publisher:v1"
+	outboxPublisherRetry    = 300 * time.Millisecond
+)
+
+type transactionBeginner interface {
+	Begin(context.Context) (pgx.Tx, error)
+}
+
+type syncProducer interface {
+	ProduceSync(context.Context, ...*kgo.Record) kgo.ProduceResults
+}
 
 // publishBatch locks a batch of pending events, publishes
 // them to Kafka, and records their broker acknowledgments.
@@ -20,8 +32,8 @@ const outboxBatchSize = 50
 // Consumers must therefore deduplicate by transaction ID.
 func publishBatch(
 	ctx context.Context,
-	db *pgxpool.Pool,
-	kafka *kgo.Client,
+	db transactionBeginner,
+	kafka syncProducer,
 ) (int, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -35,7 +47,7 @@ func publishBatch(
 		WHERE delivered_at IS NULL
 		ORDER BY created_at, transaction_id
 		LIMIT $1
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE
 	`, outboxBatchSize)
 	if err != nil {
 		return 0, err
@@ -95,10 +107,78 @@ func publishBatch(
 	return len(records), nil
 }
 
+func tryPublisherLeadership(
+	ctx context.Context,
+	conn *pgx.Conn,
+) (bool, error) {
+	// This is a session lock. The caller must publish through this same
+	// connection and close it on every exit so PostgreSQL releases leadership.
+	var acquired bool
+	err := conn.QueryRow(ctx, `
+		SELECT pg_try_advisory_lock(hashtextextended($1, 0))
+	`, outboxPublisherLockName).Scan(&acquired)
+	return acquired, err
+}
+
 func runPublisher(
 	ctx context.Context,
-	db *pgxpool.Pool,
-	kafka *kgo.Client,
+	databaseURL string,
+	kafka syncProducer,
+	metrics *ingestionMetrics,
+) {
+	for ctx.Err() == nil {
+		// Keep leadership outside the API pool. A dedicated session makes lock
+		// loss and transaction loss the same failure boundary and cannot starve
+		// HTTP requests when a small pool is configured.
+		conn, err := pgx.Connect(ctx, databaseURL)
+		if err != nil {
+			slog.Error("outbox leadership connection failed", "error", err, "outcome", "retry")
+		} else {
+			runPublisherSession(ctx, conn, kafka, metrics)
+			closeCtx, cancel := context.WithTimeout(
+				context.Background(), 5*time.Second,
+			)
+			if err := conn.Close(closeCtx); err != nil {
+				slog.Error("outbox leadership connection close failed", "error", err)
+			}
+			cancel()
+		}
+
+		if !waitForPublisherRetry(ctx) {
+			return
+		}
+	}
+}
+
+func runPublisherSession(
+	ctx context.Context,
+	conn *pgx.Conn,
+	kafka syncProducer,
+	metrics *ingestionMetrics,
+) {
+	for ctx.Err() == nil {
+		acquired, err := tryPublisherLeadership(ctx, conn)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("outbox leadership check failed", "error", err, "outcome", "reconnect")
+			}
+			return
+		}
+		if acquired {
+			slog.Info("outbox publisher leadership acquired")
+			runPublisherLeader(ctx, conn, kafka, metrics)
+			return
+		}
+		if !waitForPublisherRetry(ctx) {
+			return
+		}
+	}
+}
+
+func runPublisherLeader(
+	ctx context.Context,
+	conn *pgx.Conn,
+	kafka syncProducer,
 	metrics *ingestionMetrics,
 ) {
 	for ctx.Err() == nil {
@@ -107,7 +187,7 @@ func runPublisher(
 		)
 
 		started := time.Now()
-		count, err := publishBatch(batchCtx, db, kafka)
+		count, err := publishBatch(batchCtx, conn, kafka)
 		cancel()
 		elapsed := time.Since(started)
 		if ctx.Err() != nil {
@@ -117,6 +197,9 @@ func runPublisher(
 		if err != nil {
 			metrics.observeOutbox("failure", 0, elapsed)
 			slog.Error("outbox publication failed", "error", err, "outcome", "retry", "duration_ms", elapsed.Milliseconds())
+			if conn.IsClosed() {
+				return
+			}
 		} else if count > 0 {
 			metrics.observeOutbox("success", count, elapsed)
 			slog.Info("outbox batch published", "count", count, "outcome", "published", "duration_ms", elapsed.Milliseconds())
@@ -128,10 +211,19 @@ func runPublisher(
 			continue // More records may be waiting.
 		}
 
-		select {
-		case <-ctx.Done():
+		if !waitForPublisherRetry(ctx) {
 			return
-		case <-time.After(300 * time.Millisecond):
 		}
+	}
+}
+
+func waitForPublisherRetry(ctx context.Context) bool {
+	timer := time.NewTimer(outboxPublisherRetry)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }

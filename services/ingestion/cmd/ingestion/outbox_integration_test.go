@@ -8,13 +8,90 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
+
+type blockingOrderProducer struct {
+	mu             sync.Mutex
+	firstStarted   chan struct{}
+	firstRelease   chan struct{}
+	releaseOnce    sync.Once
+	calls          int
+	nextOffset     int64
+	publishedOrder []string
+}
+
+func newBlockingOrderProducer() *blockingOrderProducer {
+	return &blockingOrderProducer{
+		firstStarted: make(chan struct{}),
+		firstRelease: make(chan struct{}),
+	}
+}
+
+func (p *blockingOrderProducer) ProduceSync(
+	ctx context.Context,
+	records ...*kgo.Record,
+) kgo.ProduceResults {
+	p.mu.Lock()
+	call := p.calls
+	p.calls++
+	if call == 0 {
+		close(p.firstStarted)
+	}
+	p.mu.Unlock()
+
+	if call == 0 {
+		select {
+		case <-ctx.Done():
+			results := make(kgo.ProduceResults, len(records))
+			for i, record := range records {
+				results[i] = kgo.ProduceResult{
+					Record: record,
+					Err:    ctx.Err(),
+				}
+			}
+			return results
+		case <-p.firstRelease:
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	results := make(kgo.ProduceResults, len(records))
+	for i, record := range records {
+		record.Partition = 0
+		record.Offset = p.nextOffset
+		p.nextOffset++
+		p.publishedOrder = append(
+			p.publishedOrder, string(record.Value),
+		)
+		results[i] = kgo.ProduceResult{Record: record}
+	}
+	return results
+}
+
+func (p *blockingOrderProducer) releaseFirstBatch() {
+	p.releaseOnce.Do(func() { close(p.firstRelease) })
+}
+
+func (p *blockingOrderProducer) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+func (p *blockingOrderProducer) order() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.publishedOrder...)
+}
 
 func TestOutboxIntegration(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -199,4 +276,203 @@ func TestOutboxIntegration(t *testing.T) {
 	}
 
 	t.Log("PostgreSQL idempotency and Kafka publication: PASSED")
+}
+
+func TestOverlappingPublishersPreserveBatchOrder(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 20*time.Second,
+	)
+	defer cancel()
+
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.Close)
+
+	schema := fmt.Sprintf("outbox_order_%d", time.Now().UnixNano())
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cleanupCancel()
+		_, _ = admin.Exec(
+			cleanupCtx, "DROP SCHEMA "+quotedSchema+" CASCADE",
+		)
+	})
+	if _, err := admin.Exec(ctx, `
+		CREATE TABLE `+quotedSchema+`.outbox_events (
+			transaction_id TEXT PRIMARY KEY,
+			kafka_key TEXT NOT NULL,
+			payload BYTEA NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			delivered_at TIMESTAMPTZ,
+			kafka_partition INTEGER,
+			kafka_offset BIGINT
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	runID := time.Now().UnixNano()
+	ids := make([]string, outboxBatchSize+1)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("ordered-%d-%02d", runID, i)
+		_, err := admin.Exec(ctx, `
+			INSERT INTO `+quotedSchema+`.outbox_events (
+				transaction_id, kafka_key, payload, created_at
+			) VALUES ($1, $2, $3, $4)
+		`, ids[i], "shared-terminal", []byte(ids[i]), baseTime.Add(time.Duration(i)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	connect := func() *pgx.Conn {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(
+			ctx, "SET search_path TO "+quotedSchema,
+		); err != nil {
+			_ = conn.Close(ctx)
+			t.Fatal(err)
+		}
+		return conn
+	}
+	leader := connect()
+	defer leader.Close(context.Background())
+	standby := connect()
+	defer standby.Close(context.Background())
+
+	acquired, err := tryPublisherLeadership(ctx, leader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("first publisher did not acquire leadership")
+	}
+
+	producer := newBlockingOrderProducer()
+	type result struct {
+		count int
+		err   error
+	}
+	firstDone := make(chan result, 1)
+	firstFinished := make(chan struct{})
+	go func() {
+		defer close(firstFinished)
+		count, err := publishBatch(ctx, leader, producer)
+		firstDone <- result{count: count, err: err}
+	}()
+	defer func() {
+		producer.releaseFirstBatch()
+		select {
+		case <-firstFinished:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	select {
+	case <-producer.firstStarted:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	acquired, err = tryPublisherLeadership(ctx, standby)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acquired {
+		t.Fatal("overlapping publisher acquired leadership")
+	}
+	if producer.callCount() != 1 {
+		t.Fatalf(
+			"standby published during the leader batch: calls=%d",
+			producer.callCount(),
+		)
+	}
+
+	producer.releaseFirstBatch()
+	first := <-firstDone
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	if first.count != outboxBatchSize {
+		t.Fatalf(
+			"first publisher sent %d records, expected %d",
+			first.count, outboxBatchSize,
+		)
+	}
+	if err := leader.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	acquired, err = tryPublisherLeadership(ctx, standby)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("standby did not take leadership after leader exit")
+	}
+	count, err := publishBatch(ctx, standby, producer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("standby sent %d records, expected 1", count)
+	}
+
+	published := producer.order()
+	if len(published) != len(ids) {
+		t.Fatalf("published %d records, expected %d", len(published), len(ids))
+	}
+	for i := range ids {
+		if published[i] != ids[i] {
+			t.Fatalf(
+				"publish order[%d]=%s, expected %s",
+				i, published[i], ids[i],
+			)
+		}
+	}
+
+	rows, err := admin.Query(ctx, `
+		SELECT transaction_id, delivered_at IS NOT NULL,
+		       kafka_partition, kafka_offset
+		FROM `+quotedSchema+`.outbox_events
+		ORDER BY created_at, transaction_id
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for i := 0; rows.Next(); i++ {
+		var id string
+		var delivered bool
+		var partition int32
+		var offset int64
+		if err := rows.Scan(&id, &delivered, &partition, &offset); err != nil {
+			t.Fatal(err)
+		}
+		if id != ids[i] || !delivered || partition != 0 || offset != int64(i) {
+			t.Fatalf(
+				"row %d mismatch: id=%s delivered=%t partition=%d offset=%d",
+				i, id, delivered, partition, offset,
+			)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 }

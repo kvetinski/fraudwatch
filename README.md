@@ -296,6 +296,11 @@ the `fraudwatch` profile, builds and loads exact source/model-tagged images,
 waits for the Kubernetes API, applies PostgreSQL and Kafka, runs the checksum
 migration and topic Jobs, and then rolls out applications. Every mutating
 command refuses to run unless the active context is exactly `fraudwatch`.
+Application ConfigMaps and Secrets have content-addressed names, so a changed
+reference creates a real pod revision. Normal deploys refuse changed Secret
+values because PostgreSQL and Grafana credentials must first be rotated in
+their persistent stores; the confirmed preserve-data procedure is documented
+in [`docs/deployment.md`](docs/deployment.md#preserve-data-credential-rotation).
 The smoke test checks liveness, readiness, and metrics, submits a unique
 transaction, proves its outbox delivery and persisted fraud decision, verifies
 Prometheus application and Kubernetes discovery, and finds the transaction's
@@ -311,8 +316,10 @@ make k8s-local-grafana
 # Grafana: http://127.0.0.1:3000
 ```
 
-Grafana's username is `admin`; its generated password is the
-`GRAFANA_ADMIN_PASSWORD` value in the ignored mode-0600 local environment file.
+Grafana's username is `admin`; on first initialization its generated password
+is the `GRAFANA_ADMIN_PASSWORD` value in the ignored mode-0600 local environment
+file. After a preserve-data rotation, keep that file synchronized with the
+password stored by Grafana.
 The Kubernetes stack provisions Prometheus, Alertmanager, Grafana, Loki,
 Alloy, kube-state-metrics, the shared alert rules, and all five dashboards.
 

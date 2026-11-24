@@ -43,7 +43,7 @@ degradation.
 Compose supports host-oriented development and observability. Kubernetes uses
 Kustomize bases plus `local` and `ci` overlays:
 
-1. Namespace and ignored/generated Secret.
+1. Namespace and an ignored/generated, content-addressed Secret.
 2. PostgreSQL and single-node KRaft Kafka StatefulSets with persistent claims.
 3. Checksum-verified migration Job.
 4. Idempotent three-partition topic Job.
@@ -68,6 +68,12 @@ or manual overlap, and every ordered batch runs on that leadership session.
 Scoring and model-monitor also use `Recreate` so two model bundles do not
 process concurrently; parallel scoring replicas are safe only when they use
 the same immutable image.
+
+Kustomize gives shared application configuration a content-derived ConfigMap
+name. The deploy orchestrator similarly binds an immutable content-addressed
+Secret into every credential consumer and verifies that Ready pods use that
+identity. Active Secret value changes require an explicit confirmation after
+PostgreSQL and Grafana credentials have been rotated in persistent state.
 
 Publisher leadership serializes committed, visible outbox rows by
 `(created_at, transaction_id)`. It does not impose event-time or commit order

@@ -19,11 +19,12 @@ K8S_KUBE_STATE_METRICS_IMAGE := registry.k8s.io/kube-state-metrics/kube-state-me
 K8S_LOCAL_SECRET_ENV ?= infra/k8s/fraudwatch.local.env
 K8S_CI_SECRET_ENV ?= infra/k8s/fraudwatch.local.env
 K8S_WAIT_TIMEOUT ?= 300s
+K8S_SECRET_CHANGE_ARGS ?=
 
 .PHONY: k8s-check k8s-platform-images k8s-local-secrets k8s-local-start k8s-local-context \
 	k8s-local-images k8s-local-deploy k8s-local-up k8s-local-status \
 	k8s-local-smoke k8s-local-port-forward k8s-local-logs k8s-local-stop k8s-local-delete \
-	k8s-local-grafana \
+	k8s-local-grafana k8s-local-rollout-secrets \
 	k8s-ci-start k8s-ci-context k8s-ci-images k8s-ci-deploy k8s-ci-up \
 	k8s-ci-smoke k8s-ci-status k8s-ci-delete
 
@@ -103,7 +104,16 @@ k8s-local-deploy: k8s-local-secrets k8s-local-context ## Deploy ordered local ov
 		--context "$(MINIKUBE_CONTEXT)" \
 		--overlay infra/k8s/overlays/local \
 		--secret-env "$(K8S_LOCAL_SECRET_ENV)" \
-		--timeout "$(K8S_WAIT_TIMEOUT)"
+		--timeout "$(K8S_WAIT_TIMEOUT)" $(K8S_SECRET_CHANGE_ARGS)
+
+k8s-local-rollout-secrets: ## Roll out an already-coordinated credential change (CONFIRM=secret-rollout)
+	@test "$(CONFIRM)" = 'secret-rollout' || { \
+		echo 'Refusing Secret rollout without CONFIRM=secret-rollout.' >&2; \
+		echo 'Rotate the persisted PostgreSQL and Grafana credentials first.' >&2; \
+		exit 2; \
+	}
+	@$(MAKE) --no-print-directory k8s-local-deploy \
+		K8S_SECRET_CHANGE_ARGS=--allow-secret-change
 
 k8s-local-up: ## Start Minikube, build/load exact images, and deploy everything
 	@$(MAKE) --no-print-directory k8s-local-start

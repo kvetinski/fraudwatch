@@ -13,6 +13,7 @@ from fraudwatch_ml.benchmark_replay import (
     ManifestStore,
     ReplayRecord,
     assert_complete_outcomes,
+    collect_worker_model_identities,
     dataset_identity,
     iter_day_records,
     replay_timeline,
@@ -122,6 +123,12 @@ def test_manifest_checkpoints_atomically_and_rejects_changed_resume(tmp_path):
     configuration = {"run_id": "resume-1", "mode": "kafka"}
     store = ManifestStore(path, configuration)
     store.begin_attempt({"processing_timeout_seconds": 10})
+    store.record_work(
+        timeline_date="2018-04-01",
+        stage="transaction_wait",
+        seconds=0.25,
+        status="complete",
+    )
     store.checkpoint(
         {
             "timeline_date": "2018-04-01",
@@ -142,6 +149,119 @@ def test_manifest_checkpoints_atomically_and_rejects_changed_resume(tmp_path):
     assert ManifestStore(path, configuration).completed_dates == {"2018-04-01"}
     with pytest.raises(ValueError, match="configuration differs"):
         ManifestStore(path, {"run_id": "resume-1", "mode": "http"})
+
+
+def test_resume_closes_crashed_attempt_and_keeps_its_work(tmp_path):
+    path = tmp_path / "run" / "manifest.json"
+    configuration = {"run_id": "resume-1", "mode": "kafka"}
+    first = ManifestStore(path, configuration)
+    first.begin_attempt()
+    first.begin_work(
+        timeline_date="2018-04-01",
+        stage="transaction_wait",
+    )
+
+    resumed = ManifestStore(path, configuration)
+    resumed.begin_attempt()
+
+    crashed = resumed.value["attempts"][0]
+    assert crashed["status"] == "interrupted"
+    assert crashed["finish_inferred_at_resume"] is True
+    assert crashed["elapsed_seconds"] >= 0
+    assert crashed["work"][0]["status"] == "interrupted"
+    assert crashed["work"][0]["finish_inferred_at_attempt_close"] is True
+    assert crashed["work"][0]["seconds"] >= 0
+    assert resumed.value["attempts"][1]["status"] == "running"
+
+
+def test_explicit_interruption_is_terminal_and_resumable(tmp_path):
+    path = tmp_path / "run" / "manifest.json"
+    configuration = {"run_id": "resume-1", "mode": "kafka"}
+    store = ManifestStore(path, configuration)
+    store.begin_attempt()
+    store.interrupt("SIGTERM")
+
+    assert store.value["status"] == "interrupted"
+    assert store.value["interruption"]["reason"] == "SIGTERM"
+    assert store.value["attempts"][0]["status"] == "interrupted"
+    assert "finished_at" in store.value["attempts"][0]
+
+
+def test_completion_records_terminal_timing_and_worker_snapshot(tmp_path):
+    path = tmp_path / "run" / "manifest.json"
+    store = ManifestStore(path, {"run_id": "complete-1", "mode": "kafka"})
+    store.begin_attempt({"scoring_workers": [{"metrics_url": "start"}]})
+    store.record_work(
+        timeline_date="2018-04-01",
+        stage="transaction_submit",
+        seconds=1.0,
+        status="complete",
+    )
+    store.complete(
+        {"decisions": 1},
+        runtime={"scoring_workers": [{"metrics_url": "finish"}]},
+    )
+
+    attempt = store.value["attempts"][0]
+    assert store.value["status"] == "complete"
+    assert attempt["status"] == "complete"
+    assert attempt["elapsed_seconds"] >= 0
+    assert attempt["completion_runtime"]["scoring_workers"] == [
+        {"metrics_url": "finish"}
+    ]
+
+
+def test_worker_model_identity_is_read_from_every_unique_endpoint(monkeypatch):
+    digest = "sha256:" + "a" * 64
+    payload = (
+        "# TYPE fraudwatch_scoring_model_info gauge\n"
+        "fraudwatch_scoring_model_info{feature_schema_version=\"v1\","
+        f"model_digest=\"{digest}\","
+        "model_reference=\"models:/fraudwatch-hgb/1\"} 1\n"
+    ).encode()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return payload
+
+    monkeypatch.setattr(
+        "fraudwatch_ml.benchmark_replay.urlopen",
+        lambda _url, timeout: Response(),
+    )
+    workers = collect_worker_model_identities(
+        ["http://worker-b/metrics", "http://worker-a/metrics"],
+        expected_members=2,
+        expected_reference="models:/fraudwatch-hgb/1",
+        expected_digest=digest,
+        expected_feature_schema_version="v1",
+    )
+
+    assert [worker["metrics_url"] for worker in workers] == [
+        "http://worker-a/metrics",
+        "http://worker-b/metrics",
+    ]
+    with pytest.raises(ValueError, match="unique"):
+        collect_worker_model_identities(
+            ["http://worker-a/metrics", "http://worker-a/metrics"],
+            expected_members=2,
+            expected_reference="models:/fraudwatch-hgb/1",
+            expected_digest=digest,
+            expected_feature_schema_version="v1",
+        )
+    with pytest.raises(RuntimeError, match="unexpected model identity"):
+        collect_worker_model_identities(
+            ["http://worker-a/metrics"],
+            expected_members=1,
+            expected_reference="models:/fraudwatch-hgb/2",
+            expected_digest=digest,
+            expected_feature_schema_version="v1",
+        )
 
 
 def test_http_submission_is_concurrent_across_lanes_but_ordered_per_terminal():

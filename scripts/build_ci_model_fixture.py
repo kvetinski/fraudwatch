@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-from fraudwatch_ml.benchmark_replay import sha256_tree
 from fraudwatch_ml.features import FEATURE_NAMES
+from fraudwatch_ml.model_integrity import sha256_tree
 from fraudwatch_ml.model_monitoring import build_monitoring_baseline
 from fraudwatch_ml.model_serialization import SKLEARN_SERIALIZATION_FORMAT
 from fraudwatch_ml.scoring import FEATURE_SCHEMA_VERSION

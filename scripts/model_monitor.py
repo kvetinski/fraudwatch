@@ -16,7 +16,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from fraudwatch_ml.features import FEATURE_NAMES
-from fraudwatch_ml.benchmark_replay import sha256_tree
+from fraudwatch_ml.model_integrity import sha256_tree
 from fraudwatch_ml.model_monitoring import (
     build_monitoring_baseline,
     evaluate_monitoring_window,

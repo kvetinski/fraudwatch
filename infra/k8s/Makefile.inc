@@ -7,7 +7,8 @@ MINIKUBE_MEMORY ?= 7168
 KUBERNETES_VERSION ?= v1.29.2
 KIND_CLUSTER := fraudwatch-ci
 KIND_CONTEXT := kind-fraudwatch-ci
-KIND_NODE_IMAGE ?= kindest/node:v1.29.2@sha256:51a1434a5397193442f0be2a297b488b6c919ce8a3931be0ce822606ea5ca245
+KIND_NODE_IMAGE ?= kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+KIND_DIAGNOSTICS_DIR ?= artifacts/ci-diagnostics/kind
 K8S_POSTGRES_IMAGE := postgres:17-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac
 K8S_KAFKA_IMAGE := apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
 K8S_PROMETHEUS_IMAGE := prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
@@ -26,7 +27,7 @@ K8S_SECRET_CHANGE_ARGS ?=
 	k8s-local-smoke k8s-local-port-forward k8s-local-logs k8s-local-stop k8s-local-delete \
 	k8s-local-grafana k8s-local-rollout-secrets \
 	k8s-ci-start k8s-ci-context k8s-ci-images k8s-ci-deploy k8s-ci-up \
-	k8s-ci-smoke k8s-ci-status k8s-ci-delete
+	k8s-ci-smoke k8s-ci-status k8s-ci-diagnostics k8s-ci-delete
 
 define wait_for_kubernetes_api
 	@for attempt in $$(seq 1 60); do \
@@ -154,8 +155,12 @@ k8s-ci-start: k8s-check ## Create the ephemeral Kind CI cluster
 	@if kind get clusters | grep -qx "$(KIND_CLUSTER)"; then \
 		echo 'Kind cluster already exists: $(KIND_CLUSTER)'; \
 	else \
-		kind create cluster --name "$(KIND_CLUSTER)" \
-			--config infra/k8s/kind-ci.yaml --image "$(KIND_NODE_IMAGE)" --wait 120s; \
+		if ! kind create cluster --name "$(KIND_CLUSTER)" \
+			--config infra/k8s/kind-ci.yaml --image "$(KIND_NODE_IMAGE)" \
+			--wait 120s --retain; then \
+			$(MAKE) --no-print-directory k8s-ci-diagnostics || true; \
+			exit 1; \
+		fi; \
 	fi
 	@$(MAKE) --no-print-directory k8s-ci-context
 
@@ -210,6 +215,10 @@ k8s-ci-status: ## Show FraudWatch resources in the ephemeral CI cluster
 
 k8s-ci-smoke: k8s-ci-context ## Run the end-to-end smoke test against Kind
 	@$(PYTHON3) scripts/smoke_k8s.py --context "$(KIND_CONTEXT)"
+
+k8s-ci-diagnostics: ## Export Kind node and Kubernetes logs for CI triage
+	@mkdir -p "$(KIND_DIAGNOSTICS_DIR)"
+	@kind export logs --name "$(KIND_CLUSTER)" "$(KIND_DIAGNOSTICS_DIR)"
 
 k8s-ci-delete: ## Delete the ephemeral Kind CI cluster
 	@kind delete cluster --name "$(KIND_CLUSTER)"

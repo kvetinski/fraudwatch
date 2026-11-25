@@ -46,6 +46,7 @@ from fraudwatch_ml.event_ledger import record_transaction_event
 from fraudwatch_ml.features import FEATURE_NAMES
 from fraudwatch_ml.labels import resolve_pending_label
 from fraudwatch_ml.locks import lock_terminal, lock_transaction
+from fraudwatch_ml.model_integrity import verify_portable_model_digest
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 from fraudwatch_ml.profiling import EventTimings, RollingProfiler
 from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
@@ -141,7 +142,14 @@ def load_scorer() -> LoadedScorer:
         if manifest.get("model_name") != MODEL_NAME:
             raise RuntimeError("Exported model name differs from configured MODEL_NAME")
         if manifest.get("feature_names") != list(FEATURE_NAMES):
-            raise RuntimeError("Exported model feature order differs from the scoring schema")
+            raise RuntimeError(
+                "Exported model feature order differs from the scoring schema"
+            )
+        if manifest.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+            raise RuntimeError(
+                "Exported model feature schema version is unsupported"
+            )
+        model_digest = verify_portable_model_digest(bundle, manifest)
         model = prepare_model_for_array_inference(
             mlflow.sklearn.load_model(str(bundle / "model"))
         )
@@ -150,14 +158,14 @@ def load_scorer() -> LoadedScorer:
             "Loaded portable model: %s", model_reference,
             extra={
                 "model_reference": model_reference,
-                "model_digest": manifest.get("model_digest", "unknown"),
+                "model_digest": model_digest,
                 "feature_schema_version": FEATURE_SCHEMA_VERSION,
             },
         )
         return LoadedScorer(
             model=model,
             model_reference=model_reference,
-            model_digest=manifest.get("model_digest", "unknown"),
+            model_digest=model_digest,
             array_inference=True,
         )
 

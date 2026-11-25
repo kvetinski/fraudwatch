@@ -18,8 +18,8 @@ import pandas as pd
 from mlflow.tracking import MlflowClient
 from mlflow.exceptions import MlflowException
 
-from fraudwatch_ml.benchmark_replay import sha256_tree
 from fraudwatch_ml.features import FEATURE_NAMES
+from fraudwatch_ml.model_integrity import sha256_tree
 from fraudwatch_ml.model_serialization import (
     APPROVED_SKOPS_TRUSTED_TYPES,
     SKLEARN_SERIALIZATION_FORMAT,

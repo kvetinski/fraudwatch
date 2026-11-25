@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,12 +16,17 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pandas as pd
+from prometheus_client.parser import text_string_to_metric_families
 
 from fraudwatch_ml.features import LABEL_DELAY_DAYS
+from fraudwatch_ml.model_integrity import (
+    SHA256_PATTERN,
+    sha256_file,
+)
 from fraudwatch_ml.replay_data import select_day
 
 
-MANIFEST_SCHEMA = "fraudwatch.replay-manifest.v1"
+MANIFEST_SCHEMA = "fraudwatch.replay-manifest.v2"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REQUIRED_COLUMNS = frozenset(
     {
@@ -156,14 +162,6 @@ def source_day_for_transactions(
     return timeline_day if start <= timeline_day <= end else None
 
 
-def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def dataset_identity(paths: Sequence[tuple[date, Path]]) -> dict:
     """Fingerprint exact daily source bytes without loading the whole dataset."""
     aggregate = hashlib.sha256()
@@ -186,25 +184,6 @@ def dataset_identity(paths: Sequence[tuple[date, Path]]) -> dict:
     return {"sha256": aggregate.hexdigest(), "files": files}
 
 
-def sha256_tree(path: Path) -> str:
-    """Hash file contents and relative names for one immutable model bundle."""
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if path.is_file():
-        return sha256_file(path)
-
-    aggregate = hashlib.sha256()
-    files = sorted(item for item in path.rglob("*") if item.is_file())
-    if not files:
-        raise ValueError(f"Model path contains no files: {path}")
-    for item in files:
-        relative = item.relative_to(path).as_posix()
-        digest = sha256_file(item)
-        size = item.stat().st_size
-        aggregate.update(f"{relative}\0{size}\0{digest}\n".encode())
-    return aggregate.hexdigest()
-
-
 def atomic_write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -213,6 +192,66 @@ def atomic_write_json(path: Path, value: dict) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def collect_worker_model_identities(
+    urls: Sequence[str],
+    *,
+    expected_members: int,
+    expected_reference: str,
+    expected_digest: str,
+    expected_feature_schema_version: str,
+    timeout: float = 5.0,
+) -> list[dict[str, str]]:
+    """Read and validate the model bytes loaded by every scoring worker."""
+    if expected_members < 1:
+        raise ValueError("Expected scoring-worker count must be positive")
+    if len(urls) != expected_members:
+        raise ValueError(
+            f"Expected {expected_members} scoring metrics URLs, received {len(urls)}"
+        )
+    if any(not isinstance(url, str) or not url for url in urls):
+        raise ValueError("Scoring metrics URLs must be non-empty strings")
+    if len(set(urls)) != len(urls):
+        raise ValueError("Scoring metrics URLs must be unique")
+    if SHA256_PATTERN.fullmatch(expected_digest) is None:
+        raise ValueError("Expected model digest must be sha256:<64 lowercase hex>")
+
+    expected = {
+        "model_reference": expected_reference,
+        "model_digest": expected_digest,
+        "feature_schema_version": expected_feature_schema_version,
+    }
+    workers = []
+    for url in sorted(urls):
+        with urlopen(url, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+        samples = [
+            sample
+            for family in text_string_to_metric_families(payload)
+            for sample in family.samples
+            if sample.name == "fraudwatch_scoring_model_info"
+        ]
+        if len(samples) != 1:
+            raise RuntimeError(
+                f"Expected one fraudwatch_scoring_model_info sample from {url}, "
+                f"found {len(samples)}"
+            )
+        actual = {
+            key: samples[0].labels.get(key, "")
+            for key in (
+                "model_reference",
+                "model_digest",
+                "feature_schema_version",
+            )
+        }
+        if actual != expected:
+            raise RuntimeError(
+                f"Scoring worker {url} loaded unexpected model identity: "
+                f"{actual!r}; expected {expected!r}"
+            )
+        workers.append({"metrics_url": url, **actual})
+    return workers
 
 
 class ManifestStore:
@@ -244,6 +283,7 @@ class ManifestStore:
                 "timings_seconds": {},
                 "outcomes": None,
                 "failure": None,
+                "interruption": None,
             }
             self._save()
 
@@ -257,13 +297,109 @@ class ManifestStore:
 
     def begin_attempt(self, runtime: dict | None = None) -> None:
         now = format_utc(datetime.now(timezone.utc))
+        if self.value["attempts"]:
+            previous = self.value["attempts"][-1]
+            if "finished_at" not in previous:
+                self._finish_attempt(
+                    now,
+                    "interrupted",
+                    finish_inferred_at_resume=True,
+                )
         self.value["status"] = "running"
         self.value["updated_at"] = now
         self.value["failure"] = None
-        attempt = {"started_at": now}
+        self.value["interruption"] = None
+        attempt = {
+            "attempt": len(self.value["attempts"]) + 1,
+            "started_at": now,
+            "status": "running",
+            "work": [],
+        }
         if runtime is not None:
             attempt["runtime"] = runtime
         self.value["attempts"].append(attempt)
+        self._save()
+
+    def record_work(
+        self,
+        *,
+        timeline_date: str,
+        stage: str,
+        seconds: float,
+        status: str,
+    ) -> None:
+        if status not in {"complete", "failed", "interrupted"}:
+            raise ValueError(f"Unsupported replay work status: {status}")
+        if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+            raise ValueError("Replay work duration must be finite")
+        if seconds < 0:
+            raise ValueError("Replay work duration cannot be negative")
+        if not self.value["attempts"]:
+            raise RuntimeError("Cannot record replay work without an attempt")
+        attempt = self._current_attempt()
+        finished = datetime.now(timezone.utc)
+        started = finished - timedelta(seconds=seconds)
+        attempt["work"].append(
+            {
+                "timeline_date": timeline_date,
+                "stage": stage,
+                "seconds": round(seconds, 6),
+                "status": status,
+                "started_at": format_utc(started),
+                "finished_at": format_utc(finished),
+            }
+        )
+        now = format_utc(finished)
+        attempt["heartbeat_at"] = now
+        self.value["updated_at"] = now
+        self._save()
+
+    def begin_work(self, *, timeline_date: str, stage: str) -> int:
+        """Persist an in-flight stage before performing external work."""
+        if not stage:
+            raise ValueError("Replay work stage cannot be empty")
+        attempt = self._current_attempt()
+        now = format_utc(datetime.now(timezone.utc))
+        attempt["work"].append(
+            {
+                "timeline_date": timeline_date,
+                "stage": stage,
+                "started_at": now,
+                "status": "running",
+            }
+        )
+        attempt["heartbeat_at"] = now
+        self.value["updated_at"] = now
+        self._save()
+        return len(attempt["work"]) - 1
+
+    def finish_work(self, work_index: int, *, seconds: float, status: str) -> None:
+        """Finalize a previously persisted stage with measured work time."""
+        if status not in {"complete", "failed", "interrupted"}:
+            raise ValueError(f"Unsupported replay work status: {status}")
+        if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+            raise ValueError("Replay work duration must be finite")
+        if seconds < 0:
+            raise ValueError("Replay work duration cannot be negative")
+        if not isinstance(work_index, int) or work_index < 0:
+            raise RuntimeError("Replay work index is invalid")
+        attempt = self._current_attempt()
+        try:
+            work = attempt["work"][work_index]
+        except (IndexError, TypeError) as exc:
+            raise RuntimeError("Replay work index is invalid") from exc
+        if work.get("status") != "running" or "finished_at" in work:
+            raise RuntimeError("Replay work is already finished")
+        now = format_utc(datetime.now(timezone.utc))
+        work.update(
+            {
+                "finished_at": now,
+                "seconds": round(seconds, 6),
+                "status": status,
+            }
+        )
+        attempt["heartbeat_at"] = now
+        self.value["updated_at"] = now
         self._save()
 
     def checkpoint(self, checkpoint: dict) -> None:
@@ -276,12 +412,15 @@ class ManifestStore:
         self._recalculate()
         self._save()
 
-    def complete(self, outcomes: dict) -> None:
+    def complete(self, outcomes: dict, *, runtime: dict | None = None) -> None:
         now = format_utc(datetime.now(timezone.utc))
         self.value["status"] = "complete"
         self.value["updated_at"] = now
         self.value["outcomes"] = outcomes
         self.value["failure"] = None
+        self.value["interruption"] = None
+        if runtime is not None:
+            self._current_attempt()["completion_runtime"] = runtime
         self._finish_attempt(now, "complete")
         self._recalculate()
         self._save()
@@ -295,16 +434,89 @@ class ManifestStore:
             "message": str(error)[:2000],
             "at": now,
         }
+        self.value["interruption"] = None
         self._finish_attempt(now, "failed")
         self._recalculate()
         self._save()
 
-    def _finish_attempt(self, now: str, status: str) -> None:
+    def interrupt(self, reason: str) -> None:
+        now = format_utc(datetime.now(timezone.utc))
+        self.value["status"] = "interrupted"
+        self.value["updated_at"] = now
+        self.value["failure"] = None
+        self.value["interruption"] = {
+            "reason": reason[:2000],
+            "at": now,
+        }
+        self._finish_attempt(now, "interrupted")
+        self._recalculate()
+        self._save()
+
+    def _current_attempt(self) -> dict:
+        if not self.value["attempts"]:
+            raise RuntimeError("Replay has no active attempt")
+        current = self.value["attempts"][-1]
+        if current.get("status") != "running" or "finished_at" in current:
+            raise RuntimeError("Replay has no active attempt")
+        return current
+
+    def _finish_attempt(
+        self,
+        now: str,
+        status: str,
+        *,
+        finish_inferred_at_resume: bool = False,
+    ) -> None:
         if not self.value["attempts"]:
             return
         current = self.value["attempts"][-1]
         if "finished_at" not in current:
-            current.update({"finished_at": now, "status": status})
+            running_work = [
+                item
+                for item in current.get("work", [])
+                if item.get("status") == "running"
+            ]
+            if status == "complete" and running_work:
+                raise RuntimeError("Cannot complete an attempt with running work")
+            for work in running_work:
+                started_work = datetime.fromisoformat(
+                    work["started_at"].replace("Z", "+00:00")
+                )
+                finished_work = datetime.fromisoformat(
+                    now.replace("Z", "+00:00")
+                )
+                work.update(
+                    {
+                        "finished_at": now,
+                        "seconds": round(
+                            max(
+                                0.0,
+                                (finished_work - started_work).total_seconds(),
+                            ),
+                            6,
+                        ),
+                        "status": (
+                            "interrupted" if status == "interrupted" else "failed"
+                        ),
+                        "finish_inferred_at_attempt_close": True,
+                    }
+                )
+            started = datetime.fromisoformat(
+                current["started_at"].replace("Z", "+00:00")
+            )
+            finished = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            current.update(
+                {
+                    "finished_at": now,
+                    "elapsed_seconds": round(
+                        max(0.0, (finished - started).total_seconds()),
+                        6,
+                    ),
+                    "status": status,
+                }
+            )
+            if finish_inferred_at_resume:
+                current["finish_inferred_at_resume"] = True
 
     def _recalculate(self) -> None:
         checkpoints = [
@@ -325,7 +537,10 @@ class ManifestStore:
         }
         self.value["timings_seconds"] = {
             key: round(
-                sum(item.get("timings_seconds", {}).get(key, 0.0) for item in checkpoints),
+                sum(
+                    item.get("timings_seconds", {}).get(key, 0.0)
+                    for item in checkpoints
+                ),
                 6,
             )
             for key in sorted(timing_keys)
@@ -453,7 +668,8 @@ class KafkaPublisher:
         if remaining or len(deliveries) != len(events):
             raise RuntimeError(
                 f"Kafka delivery incomplete for {topic}: "
-                f"delivered={len(deliveries)} expected={len(events)} remaining={remaining}"
+                f"delivered={len(deliveries)} expected={len(events)} "
+                f"remaining={remaining}"
             )
         failures = [error for error, _ in deliveries if error is not None]
         if failures:
@@ -555,6 +771,7 @@ def wait_for_rows(
     *,
     timeout: float,
     poll_interval: float = 0.25,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> int:
     if table not in {"fraud_decisions", "fraud_labels"}:
         raise ValueError("Unsupported replay result table")
@@ -564,6 +781,8 @@ def wait_for_rows(
     deadline = time.monotonic() + timeout
     count = 0
     while time.monotonic() < deadline:
+        if stop_requested is not None and stop_requested():
+            raise InterruptedError(f"Interrupted while waiting for {table}")
         count = conn.execute(
             f"SELECT count(*) FROM {table} WHERE transaction_id = ANY(%s)",
             (list(transaction_ids),),
@@ -571,6 +790,8 @@ def wait_for_rows(
         if count == len(transaction_ids):
             return count
         time.sleep(poll_interval)
+    if stop_requested is not None and stop_requested():
+        raise InterruptedError(f"Interrupted while waiting for {table}")
     raise TimeoutError(
         f"{table}: expected {len(transaction_ids)} rows, found {count} "
         f"after {timeout:g}s"

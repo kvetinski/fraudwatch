@@ -513,7 +513,8 @@ make app-export-model
 make benchmark-replay \
   REPLAY_RUN_ID=sample-kafka-v1 \
   REPLAY_MODE=kafka \
-  REPLAY_ARGS='--days 16 --per-day 1000 --timeout 600'
+  REPLAY_ARGS='--days 16 --per-day 1000 --timeout 600 \
+    --scoring-metrics-url http://127.0.0.1:9101/metrics'
 ```
 
 For the complete HTTP-to-transactional-outbox-to-Kafka path, also start the Go
@@ -524,13 +525,23 @@ different terminals are submitted concurrently:
 make benchmark-replay \
   REPLAY_RUN_ID=sample-http-v1 \
   REPLAY_MODE=http \
-  REPLAY_ARGS='--days 16 --per-day 1000 --http-concurrency 16 --timeout 600'
+  REPLAY_ARGS='--days 16 --per-day 1000 --http-concurrency 16 --timeout 600 \
+    --scoring-metrics-url http://127.0.0.1:9101/metrics'
 ```
 
 Rerun the identical command after an interruption. Completed daily checkpoints
 are skipped; an incomplete day is published again and relies on the normal
 idempotency guarantees. Changing the dataset, model, mode, sampling, or
 topology under an existing run ID is rejected.
+
+Pass one unique scoring metrics URL for every active member of the scoring
+consumer group. The runner hashes the portable model artifact, verifies every
+worker reports that same runtime digest, and records the identities at attempt
+start, every daily checkpoint, and completion. Interrupted and failed stage
+work is persisted immediately and remains part of the final throughput timing.
+Replay manifest v2 intentionally rejects older manifests whose timing or
+runtime-model evidence is incomplete; start those measurements again with a
+new run ID.
 
 The runner reads only one source day at a time and automatically adds seven
 label-only timeline days, so every transaction receives its delayed label. A
@@ -543,9 +554,12 @@ separate terminals. Keep their metrics endpoints distinct; use the same pattern
 for the label workers on ports 9301-9303:
 
 ```bash
-FRAUDWATCH_SCORING_METRICS_PORT=9201 make run-scoring
-FRAUDWATCH_SCORING_METRICS_PORT=9202 make run-scoring
-FRAUDWATCH_SCORING_METRICS_PORT=9203 make run-scoring
+FRAUDWATCH_MODEL_DIR=artifacts/candidate-model \
+  FRAUDWATCH_SCORING_METRICS_PORT=9201 make run-scoring
+FRAUDWATCH_MODEL_DIR=artifacts/candidate-model \
+  FRAUDWATCH_SCORING_METRICS_PORT=9202 make run-scoring
+FRAUDWATCH_MODEL_DIR=artifacts/candidate-model \
+  FRAUDWATCH_SCORING_METRICS_PORT=9203 make run-scoring
 ```
 
 The workers use one native math thread, prepared PostgreSQL statements, and a
@@ -563,7 +577,10 @@ Run the complete April-through-September dataset without sampling:
 make benchmark-replay \
   REPLAY_RUN_ID=phase312-full-v1 \
   REPLAY_MODE=kafka \
-  REPLAY_ARGS='--days 183 --per-day 0 --timeout 900'
+  REPLAY_ARGS='--days 183 --per-day 0 --timeout 900 \
+    --scoring-metrics-url http://127.0.0.1:9201/metrics \
+    --scoring-metrics-url http://127.0.0.1:9202/metrics \
+    --scoring-metrics-url http://127.0.0.1:9203/metrics'
 ```
 
 Keep the scoring workers alive after the replay so their latency histograms can
@@ -583,13 +600,17 @@ make evaluate-replay \
     --metrics-url http://127.0.0.1:9203/metrics'
 ```
 
-The evaluator requires a completed, unsampled 183-day manifest. It reads one
-day at a time, fails on any feature/score/model/schema mismatch, and writes
-machine-readable JSON plus a Markdown summary beside the replay manifest. The
-reports include dataset/model identities, topology, exact counts, workstation
-and database size, throughput, lag-drain time, processing p95, calibration,
-average precision, ROC-AUC, Brier score, precision/recall at 1%, and fraud
-scenario recall.
+The evaluator requires a completed, unsampled 183-day manifest plus exactly
+one compatible scaling manifest for each of 1, 2, and 3 scoring replicas. It
+reads one day at a time, fails on any feature/score/model/schema mismatch, and
+writes machine-readable JSON plus a Markdown summary beside the replay
+manifest. The reports include dataset/model identities, topology, exact
+counts, workstation and database size, throughput, lag-drain time, processing
+p95, calibration, average precision, ROC-AUC, Brier score,
+precision/recall at 1%, and fraud scenario recall. After writing both reports,
+the command exits nonzero if any required Phase 3.12 gate failed. Generated
+replay evidence is ignored by Git and must be regenerated and retained outside
+the repository before a release or handoff.
 
 ## Tests
 

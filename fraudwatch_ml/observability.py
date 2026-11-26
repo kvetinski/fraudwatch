@@ -246,7 +246,13 @@ class ScoringMetrics(ConsumerRuntimeMetrics):
         ):
             self.errors.labels(category=category)
 
-    def set_model_identity(self, *, model_reference: str, feature_schema_version: str, model_digest: str = "unknown") -> None:
+    def set_model_identity(
+        self,
+        *,
+        model_reference: str,
+        model_digest: str,
+        feature_schema_version: str,
+    ) -> None:
         self.model_identity.info({
             "model_reference": model_reference,
             "model_digest": model_digest,

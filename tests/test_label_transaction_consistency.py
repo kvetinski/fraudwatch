@@ -15,6 +15,9 @@ from fraudwatch_ml.labels import store_label
 from services.scoring.worker import LoadedScorer, process_and_commit, process_event
 
 
+TEST_MODEL_DIGEST = "sha256:" + "a" * 64
+
+
 class FixedModel:
     def predict_proba(self, frame):
         assert frame.shape == (1, 12)
@@ -127,7 +130,11 @@ def test_pending_delay_violation_is_quarantined_when_transaction_arrives():
     tx_offset = uuid.uuid4().int % (2**62)
     early_label = label_payload(transaction_id, "2018-04-04T00:00:00Z")
     tx_payload = transaction_payload(transaction_id, terminal_id)
-    scorer = LoadedScorer(FixedModel(), "models:/fraudwatch-hgb/consistency-test")
+    scorer = LoadedScorer(
+        FixedModel(),
+        "models:/fraudwatch-hgb/consistency-test",
+        model_digest=TEST_MODEL_DIGEST,
+    )
 
     with psycopg.connect(dsn, autocommit=True) as conn:
         try:
@@ -187,7 +194,11 @@ def test_concurrent_valid_label_and_transaction_converge_to_active_label():
     tx_offset = uuid.uuid4().int % (2**62)
     tx_payload = transaction_payload(transaction_id, terminal_id)
     label = label_payload(transaction_id, "2018-04-08T00:00:00Z")
-    scorer = LoadedScorer(FixedModel(), "models:/fraudwatch-hgb/consistency-test")
+    scorer = LoadedScorer(
+        FixedModel(),
+        "models:/fraudwatch-hgb/consistency-test",
+        model_digest=TEST_MODEL_DIGEST,
+    )
     start = Barrier(2)
 
     def score():
@@ -254,7 +265,11 @@ def test_label_after_transaction_is_activated_without_staging():
     tx_offset = uuid.uuid4().int % (2**62)
     tx_payload = transaction_payload(transaction_id, terminal_id)
     label = label_payload(transaction_id, "2018-04-08T00:00:00Z")
-    scorer = LoadedScorer(FixedModel(), "models:/fraudwatch-hgb/consistency-test")
+    scorer = LoadedScorer(
+        FixedModel(),
+        "models:/fraudwatch-hgb/consistency-test",
+        model_digest=TEST_MODEL_DIGEST,
+    )
 
     with psycopg.connect(dsn, autocommit=True) as conn:
         try:

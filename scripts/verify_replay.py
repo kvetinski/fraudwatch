@@ -1,31 +1,28 @@
-
+import argparse
+import json
 import os
 from datetime import date, timedelta
 from pathlib import Path
 
-import mlflow
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import psycopg
 
-import argparse
-from fraudwatch_ml.replay_data import select_day
-
+from fraudwatch_ml.benchmark_replay import validate_run_id
 from fraudwatch_ml.features import (
     FEATURE_NAMES,
     build_features,
 )
+from fraudwatch_ml.model_integrity import verify_portable_model_digest
+from fraudwatch_ml.replay_data import select_day
+from fraudwatch_ml.scoring import FEATURE_SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data/handbook-raw/data"
 
-RUN_ID = "ec0737541795"
-DAYS = 16
-PER_DAY = 50
-
-MODEL_URI = "models:/fraudwatch-hgb/1"
+MODEL_BUNDLE = ROOT / "artifacts/candidate-model"
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -72,12 +69,38 @@ def load_replay_data(
 
 
 
+def load_verified_model(bundle: Path):
+    manifest_path = bundle / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(
+            f"Missing exported model bundle at {bundle}; run make app-export-model"
+        ) from exc
+    if manifest.get("feature_names") != list(FEATURE_NAMES):
+        raise SystemExit("Model bundle feature order differs from the replay schema")
+    if manifest.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+        raise SystemExit("Model bundle feature schema version is unsupported")
+    model_digest = verify_portable_model_digest(bundle, manifest)
+    model_reference = manifest.get("model_reference")
+    if not isinstance(model_reference, str) or not model_reference:
+        raise SystemExit("Model bundle has no model reference")
+    model = mlflow.sklearn.load_model(str(bundle / "model"))
+    return model, model_reference, model_digest
+
+
+def escaped_like_prefix(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--days", type=int, default=16)
     parser.add_argument("--per-day", type=int, default=1000)
+    parser.add_argument("--model-bundle", type=Path, default=MODEL_BUNDLE)
     args = parser.parse_args()
+    validate_run_id(args.run_id)
 
     df = load_replay_data(
         run_id=args.run_id,
@@ -98,14 +121,9 @@ def main():
         columns=FEATURE_NAMES,
     )
 
-    mlflow.set_tracking_uri(
-        f"sqlite:///{ROOT / 'mlflow.db'}"
+    model, model_reference, model_digest = load_verified_model(
+        args.model_bundle.resolve()
     )
-    mlflow.set_registry_uri(
-        f"sqlite:///{ROOT / 'mlflow.db'}"
-    )
-
-    model = mlflow.sklearn.load_model(MODEL_URI)
 
     expected_scores = model.predict_proba(X)[:, 1]
 
@@ -116,16 +134,18 @@ def main():
                 transaction_id,
                 feature_vector,
                 fraud_score,
-                model_reference
+                model_reference,
+                model_digest,
+                feature_schema_version
             FROM fraud_decisions
-            WHERE transaction_id LIKE %s
+            WHERE transaction_id LIKE %s ESCAPE '\\'
             """,
-            (f"replay-{args.run_id}-%",),
+            (escaped_like_prefix(f"replay-{args.run_id}-") + "%",),
         ).fetchall()
 
     stored = {
-        tx_id: (features, score, model_ref)
-        for tx_id, features, score, model_ref in rows
+        tx_id: (features, score, model_ref, digest, schema)
+        for tx_id, features, score, model_ref, digest, schema in rows
     }
 
     assert len(stored) == len(df), (
@@ -134,9 +154,11 @@ def main():
     )
 
     for i, tx_id in enumerate(df["replay_id"]):
-        features, score, model_ref = stored[tx_id]
+        features, score, model_ref, digest, schema = stored[tx_id]
 
-        assert model_ref == MODEL_URI
+        assert model_ref == model_reference
+        assert digest == model_digest
+        assert schema == FEATURE_SCHEMA_VERSION
 
         actual_vector = np.asarray(
             [features[name] for name in FEATURE_NAMES],
@@ -166,7 +188,8 @@ def main():
     print("Transactions compared:", len(df))
     print("Feature parity: PASSED")
     print("Prediction parity: PASSED")
-    print("Model:", MODEL_URI)
+    print("Model:", model_reference)
+    print("Model digest:", model_digest)
 
 
 if __name__ == "__main__":

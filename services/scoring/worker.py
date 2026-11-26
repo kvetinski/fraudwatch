@@ -33,20 +33,21 @@ for _thread_variable in (
 ):
     os.environ[_thread_variable] = str(NATIVE_MATH_THREADS)
 
-import mlflow
 import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import psycopg
 from confluent_kafka import Consumer, KafkaException, TopicPartition
-from mlflow.tracking import MlflowClient
 from psycopg.types.json import Jsonb
 
 from fraudwatch_ml.event_ledger import record_transaction_event
 from fraudwatch_ml.features import FEATURE_NAMES
 from fraudwatch_ml.labels import resolve_pending_label
 from fraudwatch_ml.locks import lock_terminal, lock_transaction
-from fraudwatch_ml.model_integrity import verify_portable_model_digest
+from fraudwatch_ml.model_integrity import (
+    SHA256_PATTERN,
+    verify_portable_model_digest,
+)
 from fraudwatch_ml.postgres_features import PostgresTerminalHistory
 from fraudwatch_ml.profiling import EventTimings, RollingProfiler
 from fraudwatch_ml.quarantine import InvalidTransaction, store_quarantined
@@ -77,7 +78,6 @@ KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "transactions.v1")
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "fraudwatch-scoring-v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "fraudwatch-hgb")
-MODEL_ALIAS = os.getenv("MODEL_ALIAS", "candidate")
 STATS_EVERY = int(os.getenv("STATS_EVERY", "1000"))
 PROFILE_WINDOW = int(os.getenv("PROFILE_WINDOW", "10000"))
 BATCH_SIZE_PER_PARTITION = int(
@@ -95,8 +95,12 @@ logger = logging.getLogger("fraudwatch.scoring")
 class LoadedScorer:
     model: Any
     model_reference: str
-    model_digest: str = "unknown"
+    model_digest: str
     array_inference: bool = False
+
+    def __post_init__(self) -> None:
+        if SHA256_PATTERN.fullmatch(self.model_digest) is None:
+            raise ValueError("Loaded scorer requires a verified SHA-256 model digest")
 
     def predict_probability(self, values: np.ndarray) -> float:
         """Score one schema-ordered row using the model's supported input type.
@@ -133,64 +137,44 @@ def prepare_model_for_array_inference(model: Any) -> Any:
 
 
 def load_scorer() -> LoadedScorer:
-    """Resolve the alias once and pin this worker to one concrete version."""
-    # Containers can load an exported, portable model without host MLflow paths.
-    model_dir = os.getenv("FRAUDWATCH_MODEL_DIR")
-    if model_dir:
-        bundle = Path(model_dir)
-        manifest = json.loads((bundle / "manifest.json").read_text())
-        if manifest.get("model_name") != MODEL_NAME:
-            raise RuntimeError("Exported model name differs from configured MODEL_NAME")
-        if manifest.get("feature_names") != list(FEATURE_NAMES):
-            raise RuntimeError(
-                "Exported model feature order differs from the scoring schema"
-            )
-        if manifest.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
-            raise RuntimeError(
-                "Exported model feature schema version is unsupported"
-            )
-        model_digest = verify_portable_model_digest(bundle, manifest)
-        model = prepare_model_for_array_inference(
-            mlflow.sklearn.load_model(str(bundle / "model"))
-        )
-        model_reference = manifest["model_reference"]
-        logger.info(
-            "Loaded portable model: %s", model_reference,
-            extra={
-                "model_reference": model_reference,
-                "model_digest": model_digest,
-                "feature_schema_version": FEATURE_SCHEMA_VERSION,
-            },
-        )
-        return LoadedScorer(
-            model=model,
-            model_reference=model_reference,
-            model_digest=model_digest,
-            array_inference=True,
-        )
-
-    tracking_uri = f"sqlite:///{ROOT / 'mlflow.db'}"
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_registry_uri(tracking_uri)
-
-    version = MlflowClient().get_model_version_by_alias(
-        MODEL_NAME, MODEL_ALIAS
+    """Load one verified portable bundle before Kafka is initialized."""
+    bundle = Path(
+        os.getenv("FRAUDWATCH_MODEL_DIR", ROOT / "artifacts/candidate-model")
     )
-    model_reference = f"models:/{MODEL_NAME}/{version.version}"
+    manifest_path = bundle / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"Verified portable model bundle is missing at {bundle}; "
+            "run make app-export-model"
+        )
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("model_name") != MODEL_NAME:
+        raise RuntimeError("Exported model name differs from configured MODEL_NAME")
+    if manifest.get("feature_names") != list(FEATURE_NAMES):
+        raise RuntimeError(
+            "Exported model feature order differs from the scoring schema"
+        )
+    if manifest.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Exported model feature schema version is unsupported"
+        )
+    model_digest = verify_portable_model_digest(bundle, manifest)
     model = prepare_model_for_array_inference(
-        mlflow.sklearn.load_model(model_reference)
+        mlflow.sklearn.load_model(str(bundle / "model"))
     )
+    model_reference = manifest["model_reference"]
     logger.info(
-        "Loaded model: %s", model_reference,
+        "Loaded portable model: %s", model_reference,
         extra={
             "model_reference": model_reference,
-            "model_digest": "unknown",
+            "model_digest": model_digest,
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
         },
     )
     return LoadedScorer(
         model=model,
         model_reference=model_reference,
+        model_digest=model_digest,
         array_inference=True,
     )
 
@@ -342,21 +326,22 @@ def process_event(
                 INSERT INTO fraud_decision_versions (
                     transaction_id, decision_version, event_ledger_id,
                     terminal_id, occurred_at, fraud_score, model_reference,
+                    model_digest,
                     feature_schema_version, feature_vector,
                     source_payload_hash, kafka_partition, kafka_offset,
                     origin, promoted_at
                 ) VALUES (
-                    %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     'stream', now()
                 )
                 RETURNING transaction_id
             ), decision_insert AS (
                 INSERT INTO fraud_decisions (
-                    transaction_id, fraud_score, model_reference,
+                    transaction_id, fraud_score, model_reference, model_digest,
                     feature_schema_version, feature_vector,
                     source_payload_hash, kafka_partition, kafka_offset,
                     decision_version
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
                 RETURNING transaction_id
             ), scored_insert AS (
                 INSERT INTO scored_transactions (
@@ -380,6 +365,7 @@ def process_event(
                 occurred_at.to_pydatetime(),
                 score,
                 scorer.model_reference,
+                scorer.model_digest,
                 FEATURE_SCHEMA_VERSION,
                 Jsonb(feature_vector),
                 payload_hash,
@@ -388,6 +374,7 @@ def process_event(
                 event.transaction_id,
                 score,
                 scorer.model_reference,
+                scorer.model_digest,
                 FEATURE_SCHEMA_VERSION,
                 Jsonb(feature_vector),
                 payload_hash,

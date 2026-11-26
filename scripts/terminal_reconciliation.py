@@ -84,6 +84,7 @@ def _run_dict(run) -> dict:
         "terminal_id": run.terminal_id,
         "status": run.status,
         "model_reference": run.model_reference,
+        "model_digest": run.model_digest,
         "feature_schema_version": run.feature_schema_version,
         "source_event_count": run.source_event_count,
         "source_event_sha256": run.source_event_sha256.hex(),
@@ -108,6 +109,7 @@ def main() -> None:
                 conn,
                 terminal_id=args.terminal_id,
                 model_reference=scorer.model_reference,
+                model_digest=scorer.model_digest,
                 requested_by=args.requested_by,
                 note=args.note,
             )

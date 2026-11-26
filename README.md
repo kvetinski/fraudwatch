@@ -129,9 +129,10 @@ make test
 
 `make setup` creates `.venv`, installs the project, downloads the local dataset,
 starts Kafka and PostgreSQL, applies migrations, creates both Kafka topics, and
-bootstraps an MLflow candidate model. `make obs-install` remains available as a
-small standalone metrics-client installation target; `make install` already
-includes it through the streaming dependencies.
+bootstraps an MLflow candidate model, then exports and verifies its portable
+runtime bundle. `make obs-install` remains available as a small standalone
+metrics-client installation target; `make install` already includes it through
+the streaming dependencies.
 
 Python installation and container builds consume hash-verified locks under
 `requirements/`. Change dependency ranges in `pyproject.toml`, run `make lock`,
@@ -238,6 +239,13 @@ Stop any host-run API or workers first so ports `8080`, `9101`, and `9102` are
 free. The exported candidate model under `artifacts/candidate-model/` is a
 generated, read-only deployment bundle and is intentionally excluded from Git.
 Re-export it whenever the MLflow candidate changes.
+
+The scoring worker refuses to load directly from an MLflow alias. It requires a
+portable bundle, hashes its model bytes, compares them with the manifest before
+Kafka is initialized, and stores that exact `sha256:` digest with every stream
+and reconciliation decision. Rows created before this invariant are retained
+as `legacy:unverified`; their identity is never inferred from a model reference,
+and the database rejects that marker on new rows.
 
 `make app-build` produces separate ingestion, scoring, label, model-monitor,
 and operations images. Base images are digest-pinned; Python dependencies are
@@ -457,7 +465,8 @@ records as audit artifacts.
 
 Use the dedicated workflow only for a terminal blocked by an out-of-order
 transaction. First freeze the complete transaction and label source under the
-concrete model version currently resolved by the scoring configuration:
+concrete model version and verified byte digest currently resolved by the
+scoring configuration:
 
 ```bash
 .venv/bin/python scripts/terminal_reconciliation.py preview TERMINAL_ID \
@@ -494,6 +503,11 @@ resolve quarantine or unblock the terminal:
   --requested-by "$USER" \
   --note 'source changed; replacing snapshot'
 ```
+
+Migration 014 automatically abandons any still-active reconciliation preview
+that predates verified model digests and records the reason in the run audit.
+Create a new preview for that terminal; the terminal remains blocked until a
+new verified run is promoted.
 
 Original decisions remain in `fraud_decision_versions`; `fraud_decisions` is
 only the current projection. Never resolve ordering quarantine manually as a

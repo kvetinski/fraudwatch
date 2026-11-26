@@ -102,11 +102,14 @@ def _insert_durable_replacement(conn, txid, payload, *, correct_hash=True):
     conn.execute(
         """
         INSERT INTO fraud_decisions(
-            transaction_id, fraud_score, model_reference,
+            transaction_id, fraud_score, model_reference, model_digest,
             feature_schema_version, feature_vector,
             source_payload_hash, kafka_partition, kafka_offset
-        ) VALUES (%s, 0.10, 'models:/fraudwatch-hgb/1', 'v1', '{}'::jsonb,
-                  %s, 0, 123)
+        ) VALUES (
+            %s, 0.10, 'models:/fraudwatch-hgb/1',
+            'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'v1', '{}'::jsonb, %s, 0, 123
+        )
         """,
         (txid, decision_hash),
     )

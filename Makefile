@@ -224,6 +224,7 @@ test-go: migrate ## Run Go tests, including PostgreSQL/kfake integration and rac
 test: test-python test-go ## Run complete Python + Go test suites
 
 setup: check install data up migrate topics go-deps model-bootstrap ## Bootstrap complete local development environment
+	@$(MAKE) --no-print-directory app-export-model
 	@echo 'Setup complete. Run make test, then start API/scoring/labels in separate terminals.'
 
 -include infra/observability/Makefile.inc

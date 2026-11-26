@@ -21,6 +21,10 @@ from fraudwatch_ml.terminal_order import TerminalQuarantined
 from services.scoring.worker import LoadedScorer, process_event
 
 
+TEST_MODEL_DIGEST = "sha256:" + "a" * 64
+OTHER_TEST_MODEL_DIGEST = "sha256:" + "b" * 64
+
+
 class HistorySensitiveModel:
     def predict_proba(self, features):
         count = float(features.iloc[0]["terminal_7d_count"])
@@ -155,6 +159,7 @@ def test_replay_preserves_original_and_promotes_atomically():
     scorer = LoadedScorer(
         HistorySensitiveModel(),
         "models:/fraudwatch-hgb/reconciliation-test",
+        model_digest=TEST_MODEL_DIGEST,
     )
 
     with psycopg.connect(dsn, autocommit=True) as conn:
@@ -191,11 +196,19 @@ def test_replay_preserves_original_and_promotes_atomically():
                 conn,
                 terminal_id=terminal_id,
                 model_reference=scorer.model_reference,
+                model_digest=scorer.model_digest,
                 requested_by="pytest",
                 note="verify complete late-event recovery",
             )
             assert preview.status == "previewed"
             assert preview.source_event_count == 5
+            assert conn.execute(
+                """
+                SELECT model_digest FROM terminal_reconciliation_runs
+                WHERE id = %s
+                """,
+                (preview.run_id,),
+            ).fetchone()[0] == TEST_MODEL_DIGEST
 
             verified = replay_run(conn, scorer, run_id=preview.run_id)
             assert verified.status == "verified"
@@ -204,12 +217,13 @@ def test_replay_preserves_original_and_promotes_atomically():
 
             current = conn.execute(
                 """
-                SELECT decision_version, fraud_score FROM fraud_decisions
+                SELECT decision_version, fraud_score, model_digest
+                FROM fraud_decisions
                 WHERE transaction_id = %s
                 """,
                 (original_id,),
             ).fetchone()
-            assert current == (1, 0.1)
+            assert current == (1, 0.1, TEST_MODEL_DIGEST)
             assert conn.execute(
                 """
                 SELECT count(*) FROM fraud_decisions
@@ -230,7 +244,8 @@ def test_replay_preserves_original_and_promotes_atomically():
             ).fetchone()[0] == 0
             decisions = conn.execute(
                 """
-                SELECT transaction_id, decision_version, fraud_score
+                SELECT transaction_id, decision_version, fraud_score,
+                       model_digest
                 FROM fraud_decisions
                 WHERE transaction_id = ANY(%s)
                 ORDER BY transaction_id
@@ -243,6 +258,7 @@ def test_replay_preserves_original_and_promotes_atomically():
             )
             assert original[1] == 2
             assert original[2] == pytest.approx(0.2)
+            assert {row[3] for row in decisions} == {TEST_MODEL_DIGEST}
             assert conn.execute(
                 """
                 SELECT feature_vector ->> 'terminal_7d_fraud_count'
@@ -298,7 +314,8 @@ def test_replay_preserves_original_and_promotes_atomically():
 
             versions = conn.execute(
                 """
-                SELECT decision_version, origin, promoted_at IS NOT NULL AS promoted
+                SELECT decision_version, origin,
+                       promoted_at IS NOT NULL AS promoted, model_digest
                 FROM fraud_decision_versions
                 WHERE transaction_id = %s
                 ORDER BY decision_version
@@ -306,8 +323,8 @@ def test_replay_preserves_original_and_promotes_atomically():
                 (original_id,),
             ).fetchall()
             assert versions == [
-                (1, "stream", True),
-                (2, "reconciliation", True),
+                (1, "stream", True, TEST_MODEL_DIGEST),
+                (2, "reconciliation", True, TEST_MODEL_DIGEST),
             ]
             assert {
                 row[0]
@@ -350,6 +367,7 @@ def test_promotion_rejects_source_changes_after_verification():
     scorer = LoadedScorer(
         HistorySensitiveModel(),
         "models:/fraudwatch-hgb/reconciliation-test",
+        model_digest=TEST_MODEL_DIGEST,
     )
     offsets = [uuid.uuid4().int % (2**61) for _ in range(3)]
 
@@ -376,9 +394,34 @@ def test_promotion_rejects_source_changes_after_verification():
                 conn,
                 terminal_id=terminal_id,
                 model_reference=scorer.model_reference,
+                model_digest=scorer.model_digest,
                 requested_by="pytest",
                 note="source mutation guard",
             )
+            different_digest_scorer = LoadedScorer(
+                HistorySensitiveModel(),
+                scorer.model_reference,
+                model_digest=OTHER_TEST_MODEL_DIGEST,
+            )
+            with pytest.raises(ReconciliationError, match="digest"):
+                replay_run(
+                    conn,
+                    different_digest_scorer,
+                    run_id=preview.run_id,
+                )
+            assert conn.execute(
+                """
+                SELECT status FROM terminal_reconciliation_runs WHERE id = %s
+                """,
+                (preview.run_id,),
+            ).fetchone()[0] == "previewed"
+            assert conn.execute(
+                """
+                SELECT count(*) FROM fraud_decision_versions
+                WHERE reconciliation_run_id = %s
+                """,
+                (preview.run_id,),
+            ).fetchone()[0] == 0
             replay_run(conn, scorer, run_id=preview.run_id)
 
             assert isinstance(
@@ -416,6 +459,7 @@ def test_promotion_rejects_source_changes_after_verification():
                 conn,
                 terminal_id=terminal_id,
                 model_reference=scorer.model_reference,
+                model_digest=scorer.model_digest,
                 requested_by="pytest",
                 note="replacement source snapshot",
             )
@@ -437,6 +481,7 @@ def test_operator_workflow_supports_dictionary_rows():
     scorer = LoadedScorer(
         HistorySensitiveModel(),
         "models:/fraudwatch-hgb/reconciliation-test",
+        model_digest=TEST_MODEL_DIGEST,
     )
     offsets = [uuid.uuid4().int % (2**61) for _ in range(2)]
 
@@ -468,6 +513,7 @@ def test_operator_workflow_supports_dictionary_rows():
                     operator_conn,
                     terminal_id=terminal_id,
                     model_reference=scorer.model_reference,
+                    model_digest=scorer.model_digest,
                     requested_by="pytest",
                     note="exercise CLI database row shape",
                 )

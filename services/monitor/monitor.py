@@ -43,7 +43,11 @@ pending_labels = Gauge("fraudwatch_pending_labels", "Valid delayed labels awaiti
 pending_label_age = Gauge("fraudwatch_pending_label_oldest_age_seconds", "Age of oldest pending delayed label")
 decisions = Gauge("fraudwatch_decisions", "Current projected fraud decisions")
 label_coverage = Gauge("fraudwatch_label_coverage_ratio", "Fraction of decisions with delayed labels")
-model_info = Gauge("fraudwatch_deployed_model_info", "Models represented in current decisions", ("model_reference", "feature_schema_version"))
+model_info = Gauge(
+    "fraudwatch_deployed_model_info",
+    "Models represented in current decisions",
+    ("model_reference", "model_digest", "feature_schema_version"),
+)
 monitor_success = Gauge("fraudwatch_monitor_last_success_unixtime", "Unix time of last complete monitor collection")
 monitor_errors = Counter("fraudwatch_monitor_collection_errors_total", "Cumulative monitor collection failures", ("source",))
 monitor_duration = Histogram("fraudwatch_monitor_collection_duration_seconds", "Independent monitor collection duration", ("source",))
@@ -141,10 +145,16 @@ class Monitor:
             decisions.set(decision_count)
             label_coverage.set(labeled_count / decision_count if decision_count else 0)
             model_info.clear()
-            for reference, schema in conn.execute("""
-                SELECT DISTINCT model_reference, feature_schema_version FROM fraud_decisions
+            for reference, digest, schema in conn.execute("""
+                SELECT DISTINCT model_reference, model_digest,
+                                feature_schema_version
+                FROM fraud_decisions
             """).fetchall():
-                model_info.labels(model_reference=reference, feature_schema_version=schema).set(1)
+                model_info.labels(
+                    model_reference=reference,
+                    model_digest=digest,
+                    feature_schema_version=schema,
+                ).set(1)
 
             row = conn.execute("""
                 SELECT EXTRACT(EPOCH FROM now() - evaluated_at), sample_count,

@@ -22,6 +22,7 @@ from fraudwatch_ml.features import (
 )
 from fraudwatch_ml.labels import insert_active_label, parse_label
 from fraudwatch_ml.locks import lock_terminal, lock_transaction
+from fraudwatch_ml.model_integrity import SHA256_PATTERN
 from fraudwatch_ml.online_features import TerminalHistory
 from fraudwatch_ml.quarantine import InvalidLabel, store_quarantined
 from fraudwatch_ml.scoring import (
@@ -88,6 +89,7 @@ class ReconciliationRun:
     terminal_id: str
     status: str
     model_reference: str
+    model_digest: str
     feature_schema_version: str
     source_event_count: int
     source_event_sha256: bytes
@@ -612,12 +614,15 @@ def preview_terminal(
     *,
     terminal_id: str,
     model_reference: str,
+    model_digest: str,
     requested_by: str,
     note: str,
 ) -> ReconciliationRun:
     """Freeze and audit the exact source snapshot that a replay will use."""
     if not terminal_id.strip() or not requested_by.strip() or not note.strip():
         raise ValueError("terminal_id, requested_by, and note are required")
+    if SHA256_PATTERN.fullmatch(model_digest) is None:
+        raise ValueError("model_digest must be a verified SHA-256 identity")
     with conn.transaction():
         _lock_source(conn, terminal_id)
         first_quarantine_id, _, _ = _block(conn, terminal_id)
@@ -647,16 +652,17 @@ def preview_terminal(
         row = conn.execute(
             """
             INSERT INTO terminal_reconciliation_runs (
-                terminal_id, first_quarantine_id, model_reference,
+                terminal_id, first_quarantine_id, model_reference, model_digest,
                 feature_schema_version, source_event_count,
                 source_event_sha256, requested_by, note
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
                 terminal_id,
                 first_quarantine_id,
                 model_reference,
+                model_digest,
                 FEATURE_SCHEMA_VERSION,
                 snapshot.event_count,
                 snapshot.digest,
@@ -673,6 +679,9 @@ def preview_terminal(
             {
                 "source_event_count": snapshot.event_count,
                 "source_event_sha256": snapshot.digest.hex(),
+                "model_reference": model_reference,
+                "model_digest": model_digest,
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "ordering_quarantine_ids": [
                     item.quarantine_id for item in snapshot.quarantines
                 ],
@@ -684,7 +693,7 @@ def preview_terminal(
 def _get_run_for_update(conn, run_id: int):
     row = conn.execute(
         """
-        SELECT id, terminal_id, status, model_reference,
+        SELECT id, terminal_id, status, model_reference, model_digest,
                feature_schema_version, source_event_count,
                source_event_sha256, candidate_count, candidate_sha256,
                parity_verified
@@ -702,6 +711,7 @@ def _get_run_for_update(conn, run_id: int):
         "terminal_id",
         "status",
         "model_reference",
+        "model_digest",
         "feature_schema_version",
         "source_event_count",
         "source_event_sha256",
@@ -755,6 +765,7 @@ def _candidate_record(
     version: int,
     score: float,
     model_reference: str,
+    model_digest: str,
     features: dict[str, float],
 ) -> dict[str, Any]:
     return {
@@ -764,6 +775,7 @@ def _candidate_record(
         "feature_vector": features,
         "fraud_score": float(score).hex(),
         "model_reference": model_reference,
+        "model_digest": model_digest,
         "occurred_at": _timestamp(transaction.occurred_at),
         "payload_sha256": transaction.payload_hash.hex(),
         "source": [transaction.source_partition, transaction.source_offset],
@@ -781,6 +793,7 @@ def replay_run(conn, scorer, *, run_id: int) -> ReconciliationRun:
             terminal_id,
             status,
             model_reference,
+            model_digest,
             schema_version,
             source_count,
             source_digest,
@@ -797,6 +810,10 @@ def replay_run(conn, scorer, *, run_id: int) -> ReconciliationRun:
         if scorer.model_reference != model_reference:
             raise ReconciliationError(
                 "Loaded model does not match the model pinned by the preview"
+            )
+        if scorer.model_digest != model_digest:
+            raise ReconciliationError(
+                "Loaded model bytes do not match the digest pinned by the preview"
             )
         _lock_source(conn, terminal_id)
         _block(conn, terminal_id)
@@ -857,11 +874,12 @@ def replay_run(conn, scorer, *, run_id: int) -> ReconciliationRun:
                 INSERT INTO fraud_decision_versions (
                     transaction_id, decision_version, event_ledger_id,
                     terminal_id, occurred_at, fraud_score, model_reference,
+                    model_digest,
                     feature_schema_version, feature_vector,
                     source_payload_hash, kafka_partition, kafka_offset,
                     origin, reconciliation_run_id
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     'reconciliation', %s
                 )
                 """,
@@ -873,6 +891,7 @@ def replay_run(conn, scorer, *, run_id: int) -> ReconciliationRun:
                     item.occurred_at,
                     score,
                     model_reference,
+                    model_digest,
                     FEATURE_SCHEMA_VERSION,
                     Jsonb(feature_vector),
                     item.payload_hash,
@@ -887,6 +906,7 @@ def replay_run(conn, scorer, *, run_id: int) -> ReconciliationRun:
                     version,
                     score,
                     model_reference,
+                    model_digest,
                     feature_vector,
                 )
             )
@@ -928,7 +948,8 @@ def _load_candidate_records(conn, run_id: int) -> tuple[list[tuple], list[dict]]
         SELECT versions.transaction_id, versions.decision_version,
                versions.event_ledger_id, versions.terminal_id,
                versions.occurred_at, versions.fraud_score,
-               versions.model_reference, versions.feature_schema_version,
+               versions.model_reference, versions.model_digest,
+               versions.feature_schema_version,
                versions.feature_vector, versions.source_payload_hash,
                versions.kafka_partition, versions.kafka_offset
         FROM fraud_decision_versions AS versions
@@ -947,6 +968,7 @@ def _load_candidate_records(conn, run_id: int) -> tuple[list[tuple], list[dict]]
             "occurred_at",
             "fraud_score",
             "model_reference",
+            "model_digest",
             "feature_schema_version",
             "feature_vector",
             "source_payload_hash",
@@ -965,6 +987,7 @@ def _load_candidate_records(conn, run_id: int) -> tuple[list[tuple], list[dict]]
             occurred_at,
             score,
             model_reference,
+            model_digest,
             schema_version,
             features,
             payload_hash,
@@ -979,6 +1002,7 @@ def _load_candidate_records(conn, run_id: int) -> tuple[list[tuple], list[dict]]
                 "feature_vector": features,
                 "fraud_score": float(score).hex(),
                 "model_reference": model_reference,
+                "model_digest": model_digest,
                 "occurred_at": _timestamp(occurred_at),
                 "payload_sha256": bytes(payload_hash).hex(),
                 "source": [partition, offset],
@@ -1009,6 +1033,7 @@ def promote_run(
             _,
             terminal_id,
             status,
+            _,
             _,
             _,
             source_count,
@@ -1065,12 +1090,12 @@ def promote_run(
         conn.execute(
             """
             INSERT INTO fraud_decisions (
-                transaction_id, fraud_score, model_reference,
+                transaction_id, fraud_score, model_reference, model_digest,
                 feature_schema_version, feature_vector,
                 source_payload_hash, kafka_partition, kafka_offset,
                 decision_version, scored_at
             )
-            SELECT transaction_id, fraud_score, model_reference,
+            SELECT transaction_id, fraud_score, model_reference, model_digest,
                    feature_schema_version, feature_vector,
                    source_payload_hash, kafka_partition, kafka_offset,
                    decision_version, now()
@@ -1079,6 +1104,7 @@ def promote_run(
             ON CONFLICT (transaction_id) DO UPDATE SET
                 fraud_score = EXCLUDED.fraud_score,
                 model_reference = EXCLUDED.model_reference,
+                model_digest = EXCLUDED.model_digest,
                 feature_schema_version = EXCLUDED.feature_schema_version,
                 feature_vector = EXCLUDED.feature_vector,
                 source_payload_hash = EXCLUDED.source_payload_hash,
@@ -1222,7 +1248,7 @@ def abandon_run(
 def get_run(conn, run_id: int) -> ReconciliationRun:
     row = conn.execute(
         """
-        SELECT id, terminal_id, status, model_reference,
+        SELECT id, terminal_id, status, model_reference, model_digest,
                feature_schema_version, source_event_count,
                source_event_sha256, candidate_count, candidate_sha256,
                parity_verified
@@ -1239,6 +1265,7 @@ def get_run(conn, run_id: int) -> ReconciliationRun:
         "terminal_id",
         "status",
         "model_reference",
+        "model_digest",
         "feature_schema_version",
         "source_event_count",
         "source_event_sha256",
@@ -1251,10 +1278,11 @@ def get_run(conn, run_id: int) -> ReconciliationRun:
         terminal_id=values[1],
         status=values[2],
         model_reference=values[3],
-        feature_schema_version=values[4],
-        source_event_count=values[5],
-        source_event_sha256=bytes(values[6]),
-        candidate_count=values[7],
-        candidate_sha256=(None if values[8] is None else bytes(values[8])),
-        parity_verified=values[9],
+        model_digest=values[4],
+        feature_schema_version=values[5],
+        source_event_count=values[6],
+        source_event_sha256=bytes(values[7]),
+        candidate_count=values[8],
+        candidate_sha256=(None if values[9] is None else bytes(values[9])),
+        parity_verified=values[10],
     )

@@ -12,7 +12,9 @@ from fraudwatch_ml.benchmark_replay import (
     MANIFEST_SCHEMA,
     ManifestStore,
     ReplayRecord,
+    assert_daily_model_identity,
     assert_complete_outcomes,
+    collect_run_outcomes,
     collect_worker_model_identities,
     dataset_identity,
     iter_day_records,
@@ -22,6 +24,9 @@ from fraudwatch_ml.benchmark_replay import (
     submit_http_records,
     validate_run_id,
 )
+
+
+MODEL_DIGEST = "sha256:" + "a" * 64
 
 
 def _record(transaction_id: str, terminal_id: str) -> ReplayRecord:
@@ -305,6 +310,7 @@ def test_completion_gate_rejects_any_unexpected_quarantine():
         "quarantines": 1,
         "terminal_blocks": 0,
         "model_references": ["models:/fraudwatch-hgb/1"],
+        "model_digests": [MODEL_DIGEST],
         "feature_schema_versions": ["v1"],
     }
     with pytest.raises(RuntimeError, match="quarantines=1"):
@@ -313,6 +319,97 @@ def test_completion_gate_rejects_any_unexpected_quarantine():
             expected_transactions=2,
             expected_labels=2,
             model_reference="models:/fraudwatch-hgb/1",
+            model_digest=MODEL_DIGEST,
+            feature_schema_version="v1",
+            mode="kafka",
+        )
+
+
+class _QueryResult:
+    def __init__(self, value):
+        self.value = value
+
+    def fetchall(self):
+        return self.value
+
+    def fetchone(self):
+        return self.value
+
+
+class _Connection:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+
+    def execute(self, _query, _parameters):
+        return _QueryResult(next(self.responses))
+
+
+def test_daily_model_identity_requires_the_persisted_digest():
+    expected = (
+        "models:/fraudwatch-hgb/1",
+        MODEL_DIGEST,
+        "v1",
+    )
+    assert_daily_model_identity(
+        _Connection([[expected]]),
+        ["transaction-1"],
+        model_reference=expected[0],
+        model_digest=expected[1],
+        feature_schema_version=expected[2],
+    )
+
+    wrong = (expected[0], "sha256:" + "b" * 64, expected[2])
+    with pytest.raises(RuntimeError, match="model/digest/schema"):
+        assert_daily_model_identity(
+            _Connection([[wrong]]),
+            ["transaction-1"],
+            model_reference=expected[0],
+            model_digest=expected[1],
+            feature_schema_version=expected[2],
+        )
+
+
+def test_run_outcomes_include_the_persisted_model_digest():
+    outcomes = collect_run_outcomes(
+        _Connection(
+            [
+                (
+                    2,
+                    ["models:/fraudwatch-hgb/1"],
+                    [MODEL_DIGEST],
+                    ["v1"],
+                ),
+                (2,),
+                (0,),
+                (0,),
+                (0,),
+            ]
+        ),
+        run_id="digest-evidence",
+        mode="kafka",
+    )
+
+    assert outcomes["model_digests"] == [MODEL_DIGEST]
+
+
+def test_completion_gate_rejects_a_model_digest_mismatch():
+    outcomes = {
+        "decisions": 2,
+        "labels": 2,
+        "pending_labels": 0,
+        "quarantines": 0,
+        "terminal_blocks": 0,
+        "model_references": ["models:/fraudwatch-hgb/1"],
+        "model_digests": ["sha256:" + "b" * 64],
+        "feature_schema_versions": ["v1"],
+    }
+    with pytest.raises(RuntimeError, match="model_digests"):
+        assert_complete_outcomes(
+            outcomes,
+            expected_transactions=2,
+            expected_labels=2,
+            model_reference="models:/fraudwatch-hgb/1",
+            model_digest=MODEL_DIGEST,
             feature_schema_version="v1",
             mode="kafka",
         )

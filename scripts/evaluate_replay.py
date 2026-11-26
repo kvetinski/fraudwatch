@@ -99,7 +99,7 @@ def query_decisions(conn, transaction_ids: list[str]) -> dict:
     rows = conn.execute(
         """
         SELECT transaction_id, feature_vector, fraud_score,
-               model_reference, feature_schema_version
+               model_reference, model_digest, feature_schema_version
         FROM fraud_decisions
         WHERE transaction_id = ANY(%s)
         """,
@@ -441,6 +441,7 @@ def validate_completed_replay(manifest: dict) -> dict:
         "quarantines": 0,
         "terminal_blocks": 0,
         "model_references": [config["model"]["reference"]],
+        "model_digests": [config["model"]["digest"]],
         "feature_schema_versions": [config["feature_schema_version"]],
     }
     if config["mode"] == "http":
@@ -580,15 +581,30 @@ def compare_scaling_runs(
         prefix = f"replay-{run_id}-"
         rows = conn.execute(
             """
-            SELECT transaction_id, feature_vector, fraud_score
+            SELECT transaction_id, feature_vector, fraud_score,
+                   model_reference, model_digest, feature_schema_version
             FROM fraud_decisions
             WHERE transaction_id LIKE %s ESCAPE '\\'
             """,
             (_escaped_prefix(run_id) + "%",),
         ).fetchall()
+        config = manifest["configuration"]
+        expected_identity = {
+            (
+                config["model"]["reference"],
+                config["model"]["digest"],
+                config["feature_schema_version"],
+            )
+        }
+        identities = {(row[3], row[4], row[5]) for row in rows}
+        if identities != expected_identity:
+            raise AssertionError(
+                f"Scaling run {run_id} used unexpected model identity: "
+                f"{identities!r}; expected {expected_identity!r}"
+            )
         run_map = {
             transaction_id.removeprefix(prefix): (features, score)
-            for transaction_id, features, score in rows
+            for transaction_id, features, score, *_identity in rows
         }
         expected_count = manifest["counts"]["transactions"]
         if len(rows) != expected_count or len(run_map) != expected_count:
@@ -917,15 +933,23 @@ def main() -> int:
                 [stored[transaction_id][1] for transaction_id in transaction_ids]
             )
             identities = {
-                (stored[transaction_id][2], stored[transaction_id][3])
+                (
+                    stored[transaction_id][2],
+                    stored[transaction_id][3],
+                    stored[transaction_id][4],
+                )
                 for transaction_id in transaction_ids
             }
             expected_identity = {
-                (config["model"]["reference"], config["feature_schema_version"])
+                (
+                    config["model"]["reference"],
+                    config["model"]["digest"],
+                    config["feature_schema_version"],
+                )
             }
             if identities != expected_identity:
                 raise AssertionError(
-                    f"{day}: unexpected model/schema identity {identities}"
+                    f"{day}: unexpected model/digest/schema identity {identities}"
                 )
             parity.observe(
                 expected_features,

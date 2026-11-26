@@ -480,6 +480,7 @@ def main() -> None:
                             conn,
                             ids,
                             model_reference=model["reference"],
+                            model_digest=model["digest"],
                             feature_schema_version=FEATURE_SCHEMA_VERSION,
                         )
 
@@ -554,6 +555,7 @@ def main() -> None:
                     expected_transactions=expected_transactions,
                     expected_labels=expected_labels,
                     model_reference=model["reference"],
+                    model_digest=model["digest"],
                     feature_schema_version=FEATURE_SCHEMA_VERSION,
                     mode=args.mode,
                 )

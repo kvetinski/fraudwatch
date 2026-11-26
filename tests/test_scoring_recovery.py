@@ -15,6 +15,9 @@ import pytest
 from services.scoring.worker import LoadedScorer, process_and_commit
 
 
+TEST_MODEL_DIGEST = "sha256:" + "a" * 64
+
+
 class FixedModel:
     def predict_proba(self, frame):
         assert frame.shape == (1, 12)
@@ -96,6 +99,7 @@ def test_scoring_recovers_after_db_commit_but_failed_kafka_ack():
     scorer = LoadedScorer(
         model=FixedModel(),
         model_reference="models:/fraudwatch-hgb/recovery-test",
+        model_digest=TEST_MODEL_DIGEST,
     )
 
     with psycopg.connect(dsn, autocommit=True) as conn:

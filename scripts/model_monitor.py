@@ -16,7 +16,10 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from fraudwatch_ml.features import FEATURE_NAMES
-from fraudwatch_ml.model_integrity import sha256_tree
+from fraudwatch_ml.model_integrity import (
+    SHA256_PATTERN,
+    verify_portable_model_digest,
+)
 from fraudwatch_ml.model_monitoring import (
     build_monitoring_baseline,
     evaluate_monitoring_window,
@@ -44,7 +47,25 @@ def read_bundle(bundle: Path) -> tuple[dict, Path]:
     return json.loads(manifest_path.read_text(encoding="utf-8")), manifest_path
 
 
-def latest_replay_report(model_reference: str) -> dict | None:
+def verified_baseline_identity(baseline: dict) -> dict:
+    """Require a deployable byte identity before querying or persisting data."""
+    identity = baseline.get("identity")
+    if not isinstance(identity, dict):
+        raise SystemExit("Monitoring baseline has no identity object")
+    for field in (
+        "model_reference",
+        "feature_schema_version",
+        "dataset_fingerprint",
+    ):
+        if not isinstance(identity.get(field), str) or not identity[field]:
+            raise SystemExit(f"Monitoring baseline has an invalid {field}")
+    digest = identity.get("model_digest")
+    if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest) is None:
+        raise SystemExit("Monitoring baseline has an invalid model_digest")
+    return identity
+
+
+def latest_replay_report(model_reference: str, model_digest: str) -> dict | None:
     reports = sorted(
         (ROOT / "artifacts/replays").glob("*/phase-3.12-report.json"),
         key=lambda path: path.stat().st_mtime,
@@ -52,15 +73,35 @@ def latest_replay_report(model_reference: str) -> dict | None:
     )
     for path in reports:
         report = json.loads(path.read_text(encoding="utf-8"))
-        if report.get("model", {}).get("reference") == model_reference:
+        model = report.get("model", {})
+        if (
+            model.get("reference") == model_reference
+            and model.get("digest") == model_digest
+        ):
             return report
     return None
 
 
-def load_rows(conn, *, model_reference: str, start: datetime | None,
-              end: datetime | None, limit: int | None) -> tuple[np.ndarray, np.ndarray, list[int | None]]:
-    clauses = ["fd.model_reference = %s"]
-    parameters: list[object] = [model_reference]
+def load_rows(
+    conn,
+    *,
+    model_reference: str,
+    model_digest: str,
+    feature_schema_version: str,
+    start: datetime | None,
+    end: datetime | None,
+    limit: int | None,
+) -> tuple[np.ndarray, np.ndarray, list[int | None]]:
+    clauses = [
+        "fd.model_reference = %s",
+        "fd.model_digest = %s",
+        "fd.feature_schema_version = %s",
+    ]
+    parameters: list[object] = [
+        model_reference,
+        model_digest,
+        feature_schema_version,
+    ]
     if start is not None:
         clauses.append("fd.scored_at >= %s")
         parameters.append(start)
@@ -97,18 +138,23 @@ def build_baseline(args) -> None:
     bundle = args.bundle.resolve()
     manifest, manifest_path = read_bundle(bundle)
     reference = manifest["model_reference"]
-    model_digest = manifest.get("model_digest") or f"sha256:{sha256_tree(bundle / 'model')}"
+    model_digest = verify_portable_model_digest(bundle, manifest)
+    feature_schema_version = manifest.get("feature_schema_version")
+    if not isinstance(feature_schema_version, str) or not feature_schema_version:
+        raise SystemExit("Model manifest has no feature schema version")
     with psycopg.connect(args.database_url) as conn:
         features, scores, labels = load_rows(
             conn,
             model_reference=reference,
+            model_digest=model_digest,
+            feature_schema_version=feature_schema_version,
             start=args.start,
             end=args.end,
             limit=args.max_samples,
         )
     if any(label is None for label in labels):
         raise SystemExit("Baseline rows must all have delayed labels")
-    report = latest_replay_report(reference)
+    report = latest_replay_report(reference, model_digest)
     dataset_fingerprint = args.dataset_fingerprint
     if dataset_fingerprint is None and report:
         dataset_fingerprint = f"sha256:{report['dataset']['sha256']}"
@@ -121,7 +167,7 @@ def build_baseline(args) -> None:
         model_reference=reference,
         model_digest=model_digest,
         dataset_fingerprint=dataset_fingerprint,
-        feature_schema_version=manifest.get("feature_schema_version", "v1"),
+        feature_schema_version=feature_schema_version,
     )
     if report and report.get("september_holdout"):
         baseline["validation_metrics"] = {
@@ -154,11 +200,13 @@ def build_baseline(args) -> None:
 
 def evaluate(args, *, emit: bool = True) -> dict:
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
-    identity = baseline["identity"]
+    identity = verified_baseline_identity(baseline)
     with psycopg.connect(args.database_url) as conn:
         features, scores, labels = load_rows(
             conn,
             model_reference=identity["model_reference"],
+            model_digest=identity["model_digest"],
+            feature_schema_version=identity["feature_schema_version"],
             start=args.start,
             end=args.end,
             limit=None,
@@ -177,9 +225,10 @@ def evaluate(args, *, emit: bool = True) -> dict:
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s
             )
-            ON CONFLICT (model_reference, window_start, window_end) DO UPDATE SET
-                model_digest = EXCLUDED.model_digest,
-                feature_schema_version = EXCLUDED.feature_schema_version,
+            ON CONFLICT (
+                model_reference, model_digest, feature_schema_version,
+                window_start, window_end
+            ) DO UPDATE SET
                 dataset_fingerprint = EXCLUDED.dataset_fingerprint,
                 sample_count = EXCLUDED.sample_count,
                 labeled_count = EXCLUDED.labeled_count,

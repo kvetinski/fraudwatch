@@ -1,6 +1,7 @@
 import pytest
 
 from scripts.evaluate_replay import (
+    compare_scaling_runs,
     failed_phase_gates,
     histogram_quantile,
     phase_gate_exit_code,
@@ -87,6 +88,7 @@ def _manifest(run_id: str, replicas: int, *, dataset_sha: str = "dataset") -> di
             "quarantines": 0,
             "terminal_blocks": 0,
             "model_references": ["models:/fraudwatch-hgb/1"],
+            "model_digests": [MODEL_DIGEST],
             "feature_schema_versions": ["v1"],
         },
         "attempts": [
@@ -266,6 +268,64 @@ def test_completed_replay_rejects_counts_that_disagree_with_checkpoints():
     manifest["counts"]["transactions"] = 11
     with pytest.raises(ValueError, match="differ from checkpoints"):
         validate_completed_replay(manifest)
+
+
+def test_completed_replay_rejects_a_durable_outcome_digest_mismatch():
+    manifest = _manifest("full", 1)
+    manifest["outcomes"]["model_digests"] = ["sha256:" + "b" * 64]
+
+    with pytest.raises(ValueError, match="model_digests"):
+        validate_completed_replay(manifest)
+
+
+class _Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+
+class _ScalingConnection:
+    def __init__(self, *, mismatched_run_id: str | None = None):
+        self.mismatched_run_id = mismatched_run_id
+
+    def execute(self, _query, parameters):
+        escaped_prefix = parameters[0].removesuffix("%")
+        run_id = escaped_prefix.removeprefix("replay-").removesuffix("-")
+        digest = (
+            "sha256:" + "b" * 64
+            if run_id == self.mismatched_run_id
+            else MODEL_DIGEST
+        )
+        rows = [
+            (
+                f"replay-{run_id}-{index}",
+                {},
+                0.5,
+                "models:/fraudwatch-hgb/1",
+                digest,
+                "v1",
+            )
+            for index in range(10)
+        ]
+        return _Rows(rows)
+
+
+def test_scaling_db_rows_must_match_the_manifest_model_digest():
+    primary = _manifest("full", 3)
+    manifests = [
+        _manifest("scale-1", 1),
+        _manifest("scale-2", 2),
+        _manifest("scale-3", 3),
+    ]
+
+    with pytest.raises(AssertionError, match="scale-2.*unexpected model identity"):
+        compare_scaling_runs(
+            _ScalingConnection(mismatched_run_id="scale-2"),
+            manifests,
+            primary,
+        )
 
 
 def test_completed_replay_rejects_incomplete_stage_and_delivery_evidence():

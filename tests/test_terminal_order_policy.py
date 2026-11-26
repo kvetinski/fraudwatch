@@ -15,6 +15,9 @@ import pytest
 from services.scoring.worker import LoadedScorer, process_and_commit
 
 
+TEST_MODEL_DIGEST = "sha256:" + "a" * 64
+
+
 class FixedModel:
     def predict_proba(self, features):
         assert features.shape == (1, 12)
@@ -91,7 +94,11 @@ def test_late_event_quarantines_and_blocks_only_its_terminal():
     late = Message(f"order-late-{salt}", a, "2018-04-01T01:00:00Z", offsets[1])
     later = Message(f"order-later-{salt}", a, "2018-04-01T03:00:00Z", offsets[2])
     healthy = Message(f"order-healthy-{salt}", b, "2018-04-01T03:00:00Z", offsets[3])
-    scorer = LoadedScorer(FixedModel(), "models:/fraudwatch-hgb/order-test")
+    scorer = LoadedScorer(
+        FixedModel(),
+        "models:/fraudwatch-hgb/order-test",
+        model_digest=TEST_MODEL_DIGEST,
+    )
     consumer = CheckedCommit(dsn, expected_quarantine_offset=late.offset())
 
     with psycopg.connect(dsn, autocommit=True) as conn:
@@ -186,7 +193,11 @@ def test_storage_failure_does_not_commit_or_block(monkeypatch):
     terminal = f"order-failure-{salt}"
     t0 = Message(f"original-{salt}", terminal, "2018-04-01T02:00:00Z", uuid.uuid4().int % (2**61))
     t1 = Message(f"late-{salt}", terminal, "2018-04-01T01:00:00Z", uuid.uuid4().int % (2**61))
-    scorer = LoadedScorer(FixedModel(), "models:/fraudwatch-hgb/order-test")
+    scorer = LoadedScorer(
+        FixedModel(),
+        "models:/fraudwatch-hgb/order-test",
+        model_digest=TEST_MODEL_DIGEST,
+    )
 
     class CountCommits:
         calls = 0

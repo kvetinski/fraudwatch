@@ -803,23 +803,25 @@ def assert_daily_model_identity(
     transaction_ids: Sequence[str],
     *,
     model_reference: str,
+    model_digest: str,
     feature_schema_version: str,
 ) -> None:
     if not transaction_ids:
         return
     rows = conn.execute(
         """
-        SELECT DISTINCT model_reference, feature_schema_version
+        SELECT DISTINCT model_reference, model_digest, feature_schema_version
         FROM fraud_decisions
         WHERE transaction_id = ANY(%s)
         """,
         (list(transaction_ids),),
     ).fetchall()
-    identities = {(row[0], row[1]) for row in rows}
-    expected = {(model_reference, feature_schema_version)}
+    identities = {(row[0], row[1], row[2]) for row in rows}
+    expected = {(model_reference, model_digest, feature_schema_version)}
     if identities != expected:
         raise RuntimeError(
-            f"Replay decisions used unexpected model/schema identities: {identities}"
+            "Replay decisions used unexpected model/digest/schema identities: "
+            f"{identities}"
         )
 
 
@@ -835,6 +837,7 @@ def collect_run_outcomes(conn, *, run_id: str, mode: str) -> dict:
     decisions = conn.execute(
         """
         SELECT count(*), array_agg(DISTINCT model_reference),
+               array_agg(DISTINCT model_digest),
                array_agg(DISTINCT feature_schema_version)
         FROM fraud_decisions
         WHERE transaction_id LIKE %s ESCAPE '\\'
@@ -877,7 +880,11 @@ def collect_run_outcomes(conn, *, run_id: str, mode: str) -> dict:
         "quarantines": quarantines,
         "terminal_blocks": blocks,
         "model_references": sorted(decisions[1] or []),
-        "feature_schema_versions": sorted(decisions[2] or []),
+        "model_digests": sorted(
+            decisions[2] or [],
+            key=lambda value: (value is not None, value or ""),
+        ),
+        "feature_schema_versions": sorted(decisions[3] or []),
     }
 
     if mode == "http":
@@ -904,6 +911,7 @@ def assert_complete_outcomes(
     expected_transactions: int,
     expected_labels: int,
     model_reference: str,
+    model_digest: str,
     feature_schema_version: str,
     mode: str,
 ) -> None:
@@ -914,6 +922,7 @@ def assert_complete_outcomes(
         "quarantines": 0,
         "terminal_blocks": 0,
         "model_references": [model_reference],
+        "model_digests": [model_digest],
         "feature_schema_versions": [feature_schema_version],
     }
     for key, value in expected.items():
